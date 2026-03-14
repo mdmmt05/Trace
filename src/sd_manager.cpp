@@ -24,7 +24,7 @@ bool sdInit(){
 }
 
 bool sdOpenFile(const char* path) {
-    dataFile = SD.open(path, FILE_APPEND);
+    dataFile = SD.open(path, FILE_WRITE);
     if (!dataFile) return false;
 
     if (dataFile.size() == 0){
@@ -34,19 +34,24 @@ bool sdOpenFile(const char* path) {
             "satelliti,hdop,"
             "velocita_obd_kmh,"
             "accel_lon_G,accel_lat_G,"
+            "roll_deg,pitch_deg,slope_deg,slope_reliable,"
             "rpm,load_pct,throttle_pct"
         );
     }
     return true;
 }
 
-void sdWriteRow(const char* timestamp,
-    float lat, float lon,
+void sdWriteRow(
+    const char* timestamp,
+    float lat,  float lon,
     float alt,
     uint8_t satellites,
     float hdop,
     float speedObd,
     float lonAcc, float latAcc,
+    float roll,   float pitch,
+    float slope,
+    uint8_t slopeReliable,
     int rpm,
     int load,
     float throttle)
@@ -62,6 +67,10 @@ void sdWriteRow(const char* timestamp,
     dataFile.print(speedObd, 1);      dataFile.print(",");
     dataFile.print(lonAcc, 3);        dataFile.print(",");
     dataFile.print(latAcc, 3);        dataFile.print(",");
+    dataFile.print(roll, 1);          dataFile.print(",");
+    dataFile.print(pitch, 1);         dataFile.print(",");
+    dataFile.print(slope, 1);         dataFile.print(",");
+    dataFile.print(slopeReliable);    dataFile.print(",");
     dataFile.print(rpm);              dataFile.print(",");
     dataFile.print(load);             dataFile.print(",");
     dataFile.println(throttle, 1);

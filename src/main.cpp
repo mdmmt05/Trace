@@ -5,14 +5,15 @@
 #include "web_server.h"
 #include "gnss_manager.h"
 #include "obd2_manager.h"
+#include "imu_manager.h"
 
 // ---------------------------------------------------------------------------
-// Definizione dell'istanza globale condivisa (dichiarata extern in shared_data.h)
+// Istanza globale condivisa (extern in shared_data.h)
 // ---------------------------------------------------------------------------
 VehicleData vehicleData;
 
 // ---------------------------------------------------------------------------
-// Pin RGB — modifica qui quando decidi i pin definitivi
+// Pin RGB — modifica con i pin definitivi
 // ---------------------------------------------------------------------------
 static const int PIN_RGB_R = 4;
 static const int PIN_RGB_G = 5;
@@ -21,8 +22,8 @@ static const int PIN_RGB_B = 6;
 // ---------------------------------------------------------------------------
 // Costanti sistema
 // ---------------------------------------------------------------------------
-static const unsigned long GNSS_FIX_TIMEOUT_MS = 5UL * 60UL * 1000UL;  // 5 minuti
-static const unsigned long LOG_INTERVAL_MS      = 500;                   // log ogni 500ms
+static const unsigned long GNSS_FIX_TIMEOUT_MS = 5UL * 60UL * 1000UL;
+static const unsigned long LOG_INTERVAL_MS      = 500;
 
 // ---------------------------------------------------------------------------
 // Stato sistema
@@ -31,7 +32,7 @@ enum SystemState { SYS_WAITING_FIX, SYS_RUNNING };
 static SystemState sysState = SYS_WAITING_FIX;
 
 // ---------------------------------------------------------------------------
-// LED di attesa fix: lampeggio rosso bloccante (non usa rgbUpdate)
+// LED attesa fix: lampeggio rosso non bloccante
 // ---------------------------------------------------------------------------
 static void blinkWaitingFix() {
   static unsigned long lastBlink = 0;
@@ -43,69 +44,59 @@ static void blinkWaitingFix() {
 }
 
 // ---------------------------------------------------------------------------
-// Costruisce il nome file CSV dal timestamp GNSS: "/YYYYMMDD_HHMMSS.csv"
-// Garantisce un file separato per ogni sessione di guida.
+// Nome file CSV dalla data/ora GNSS
 // ---------------------------------------------------------------------------
 static void buildFilename(char* buf, size_t bufSize) {
   GnssData g = gnssGetData();
   snprintf(buf, bufSize, "/%04d%02d%02d_%02d%02d%02d.csv",
-           g.year, g.month, g.day,
-           g.hour, g.minute, g.second);
+           g.year, g.month, g.day, g.hour, g.minute, g.second);
 }
 
 // ---------------------------------------------------------------------------
 void setup() {
+  // Serial0 (USB nativa) — condivisa con obd2_manager in modalità UART.
+  // I Serial.print di debug sono COMMENTATI per non inquinare il canale OBD2.
+  // Da decommentare solo se si usa il TWAI reale (OBD2_USE_TWAI definito).
   Serial.begin(115200);
   delay(500);
 
-  // LED RGB
   rgbInit(PIN_RGB_R, PIN_RGB_G, PIN_RGB_B);
-  //Serial.println("[RGB] OK");
-
-  // GNSS
   gnssInit();
-  //Serial.println("[GNSS] OK");
+  obd2Init();
 
-  // SD
-  if (!sdInit()) { 
-    //Serial.println("SD init fallita");
-    return;
+  // imuInit() dura ~1 secondo (calibrazione giroscopio).
+  // Deve essere chiamato a veicolo fermo — i Serial.println qui dentro
+  // sono ok perché obd2Update() non è ancora nel loop.
+  if (!imuInit()) {
+    // IMU non trovata: il sistema continua senza dati IMU (campi a 0)
+    // Serial.println("[SYS] IMU non disponibile — dati IMU saranno 0");
   }
-  
-  // WebServer + WiFi AP
+
+  if (!sdInit()) {
+    // Serial.println("[SD] Init fallita");   // <-- commentato in modalità UART sim
+  }
+
   webServerInit();
 
-  //Serial.println("[SYS] In attesa del fix GNSS...");
+  // Serial.println("[SYS] In attesa del fix GNSS...");
 }
 
 // ---------------------------------------------------------------------------
 void loop() {
-  // 1. Feed GNSS
   gnssUpdate();
-  
-  // 2. Gestisci richieste HTTP
-  webServerHandle();
-  
-  // 3. Aggiorna dati OBD2 (simulati ora, TWAI in futuro)
   obd2Update();
+  webServerHandle();
+  imuUpdate(); // chiamato ad ogni loop - più frequente = migliore stima
 
-  // ── STATO: ATTESA FIX ──────────────────────────────────────────────────
+  // ── ATTESA FIX ────────────────────────────────────────────────────────────
   if (sysState == SYS_WAITING_FIX) {
     blinkWaitingFix();
 
-    bool fixOk      = gnssHasFix();
-    bool timedOut   = (millis() > GNSS_FIX_TIMEOUT_MS);
+    bool fixOk    = gnssHasFix();
+    bool timedOut = (millis() > GNSS_FIX_TIMEOUT_MS);
 
-    if (!fixOk && !timedOut) return;  // continua ad aspettare
+    if (!fixOk && !timedOut) return;
 
-    // Fix ottenuto o timeout scaduto
-    if (fixOk) {
-      //Serial.println("[GNSS] Fix ottenuto!");
-    } else {
-      //Serial.println("[GNSS] Timeout fix — avvio senza posizione valida");
-    }
-
-    // Apri file CSV con nome basato sul timestamp GNSS (o millis() se no fix)
     char filename[32];
     if (fixOk) {
       buildFilename(filename, sizeof(filename));
@@ -113,44 +104,49 @@ void loop() {
       snprintf(filename, sizeof(filename), "/nognss_%lu.csv", millis());
     }
 
-    if (!sdOpenFile(filename)) {
-      //Serial.printf("[SD] Impossibile aprire %s\n", filename);
-    } else {
-      //Serial.printf("[SD] Logging su %s\n", filename);
-    }
-
-    // Ripristina LED all'algoritmo impostato dal webserver
+    sdOpenFile(filename);
     rgbSetMode(rgbGetMode());
-
     sysState = SYS_RUNNING;
     return;
   }
 
-  // ── STATO: RUNNING ────────────────────────────────────────────────────
-  // 4. Algoritmo LED
+  // ── RUNNING ───────────────────────────────────────────────────────────────
   rgbUpdate();
 
-  // 5. Log su SD ogni LOG_INTERVAL_MS
   static unsigned long lastLog = 0;
-  if (millis() - lastLog >= LOG_INTERVAL_MS) {
-    lastLog = millis();
-    
-    char ts[20];
-    gnssFormatTimestamp(ts, sizeof(ts));
+  unsigned long now = millis();
+  if (now - lastLog < LOG_INTERVAL_MS) return;
+  lastLog = now;
 
-    GnssData g = gnssGetData();
-    
-    sdWriteRow(
-      ts,
-      g.lat, g.lon,                           // lon, lat
-      g.altMeters,
-      g.satellites,
-      g.hdop,
-      vehicleData.speed,
-      vehicleData.lonAcc, vehicleData.latAcc, // accelerometro non ancora integrato
-      vehicleData.rpm,
-      vehicleData.load,                       // load
-      vehicleData.throttle                    //throttle
-    );
-  }
+  char ts[20];
+  gnssFormatTimestamp(ts, sizeof(ts));
+  GnssData g = gnssGetData();
+  ImuData   imu = imuGetData();
+
+  // ── Flag affidabilità pendenza ────────────────────────────────────────────
+  // Calcola |dv/dt| dalla velocità OBD2 tra due campioni consecutivi.
+  // LOG_INTERVAL_MS = 500ms → dt = 0.5s
+  // Soglia 0.5 m/s² ≈ 0.14G: sotto questa soglia la distorsione del pitch
+  // per effetto inerziale è < 8°, accettabile come stima pendenza.
+  // Conversione: OBD2 speed è in km/h → dividi per 3.6 per avere m/s.
+  static float prevSpeedMs = 0.0f;
+  float currSpeedMs   = vehicleData.speed / 3.6f;
+  float accelEstMs2   = fabsf(currSpeedMs - prevSpeedMs) / (LOG_INTERVAL_MS / 1000.0f);
+  prevSpeedMs         = currSpeedMs;
+ 
+  // Soglia 0.5 m/s²: corrisponde a ~0.05G, distorsione pitch < 3°
+  static const float SLOPE_RELIABLE_THRESHOLD_MS2 = 0.5f;
+  uint8_t slopeReliable = (accelEstMs2 < SLOPE_RELIABLE_THRESHOLD_MS2) ? 1 : 0;
+
+  sdWriteRow(ts,
+    g.lat, g.lon, g.altMeters,
+    g.satellites, g.hdop,
+    vehicleData.speed,
+    imu.lonAcc,  imu.latAcc,
+    imu.roll,    imu.pitch,
+    imu.slope,   slopeReliable,
+    vehicleData.rpm,
+    vehicleData.load,
+    vehicleData.throttle
+  );
 }
