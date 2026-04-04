@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 #include "shared_data.h"
 #include "sd_manager.h"
 #include "rgb_controller.h"
@@ -54,11 +55,15 @@ static void buildFilename(char* buf, size_t bufSize) {
 
 // ---------------------------------------------------------------------------
 void setup() {
-  // Serial0 (USB nativa) — condivisa con obd2_manager in modalità UART.
-  // I Serial.print di debug sono COMMENTATI per non inquinare il canale OBD2.
-  // Da decommentare solo se si usa il TWAI reale (OBD2_USE_TWAI definito).
+  // Serial0 — condivisa con obd2_manager in modalità UART sim.
+  // IMPORTANTE: while(!Serial) senza timeout blocca il boot se l'USB non è
+  // connessa (uso in auto senza PC). Si usa un timeout di 2 secondi.
   Serial.begin(115200);
-  delay(500);
+  {
+    unsigned long t0 = millis();
+    while (!Serial && millis() - t0 < 2000) { delay(10); }
+  }
+  delay(200);
 
   rgbInit(PIN_RGB_R, PIN_RGB_G, PIN_RGB_B);
   gnssInit();
@@ -68,12 +73,20 @@ void setup() {
   // Deve essere chiamato a veicolo fermo — i Serial.println qui dentro
   // sono ok perché obd2Update() non è ancora nel loop.
   if (!imuInit()) {
-    // IMU non trovata: il sistema continua senza dati IMU (campi a 0)
-    // Serial.println("[SYS] IMU non disponibile — dati IMU saranno 0");
+    // IMU non trovata: continua senza dati IMU (campi a 0 nel CSV)
+    rgbSetColor(255, 128, 0);   // LED arancione = warning IMU assente
+    delay(2000);
   }
+  esp_task_wdt_reset(); // feed watchdog dopo calibrazione
 
   if (!sdInit()) {
     // Serial.println("[SD] Init fallita");   // <-- commentato in modalità UART sim
+    // SD non presente o corrotta: segnala con LED rosso lampeggiante 3×
+    for (int i = 0; i < 3; i++) {
+      rgbSetColor(255, 0, 0); delay(200);
+      rgbOff();               delay(200);
+    }
+    // Il sistema continua — GNSS e OBD2 funzionano, solo il logging è disabilitato
   }
 
   webServerInit();

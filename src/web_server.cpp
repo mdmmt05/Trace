@@ -903,11 +903,14 @@ void webServerInit() {
     WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
     WiFi.softAP(AP_SSID, AP_PASSWORD);
 
-    Serial.print("[WiFi] AP avviato: ");
-    Serial.println(AP_SSID);
-    Serial.print("[WiFi] IP: ");
-    Serial.println(WiFi.softAPIP());
-
+    // Serial attivo solo in modalità TWAI (produzione) — in UART sim inquinerebbe il canale OBD2
+    #ifdef OBD2_TRANSPORT_TWAI
+      Serial.print("[WiFi] AP avviato: ");
+      Serial.println(AP_SSID);
+      Serial.print("[WiFi] IP: ");
+      Serial.println(WiFi.softAPIP());
+    #endif
+    
     // Registra routes
     server.on("/",            HTTP_GET,  handleRoot);
     server.on("/api/status",  HTTP_GET,  handleGetStatus);
