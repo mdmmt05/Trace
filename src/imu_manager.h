@@ -2,13 +2,27 @@
  
 // ---------------------------------------------------------------------------
 // imu_manager.h
-// Gestione MPU6500 (accelerometro + giroscopio 6-DOF) via I2C.
+// Gestione ISM330DHCX (accelerometro + giroscopio 6-DOF) via I2C.
 //
-// Produce via fusione sensori (filtro di Madgwick):
-//   - Accelerazione longitudinale / laterale in G (gravità sottratta)
-//   - Rollio (roll)  e beccheggio (pitch) in gradi
-//   - Stima pendenza longitudinale in gradi (affidabile a veicolo fermo
-//     o a velocità costante; degradata in accelerazione/frenata)
+// Caratteristiche:
+//   - Lettura FIFO con timestamp basato su ODR fisso (nessun jitter del loop)
+//   - Calibrazione persistente in NVS (Preferences) - separata tra:
+//      - Intrinseca: gyro bias, acc bias, acc scale
+//      - Mounting: roll e pitch del sensore rispetto al veicolo
+//   - Filtro di Madgwick 6DOF con beta adattivo (peso accelerometro ridotto in condizioni dinamiche)
+//   - Rilevazione quasi-statica (modulo aggelerazione circa pari a 1g e gyro basso)
+//   - Stima slope dedicata (aggiornata lentamente in quasi-statica)
+//   - Output di confidence per la slope (0...1)
+//
+// API di commissioning:
+//   imuRunGyroCalibration()   – calibrazione giroscopio (veicolo fermo)
+//   imuRunAccelCalibration()  – calibrazione accelerometro (veicolo fermo e in piano)
+//   imuSetMountingAlignment() – imposta offset di montaggio (gradi)
+//   imuSaveCalibration()      – salva in NVS
+//   imuResetCalibration()     – ripristina default e salva
+//   imuLoadCalibration()      – ricarica da NVS
+//   imuHasValidCalibration()  – true se NVS contiene dati validi
+//   imuGetCalibrationInfo()   – restituisce struct diagnostica
 //
 // Convenzione assi — modulo montato PARALLELO AL PAVIMENTO, X VERSO IL MUSO:
 //   X+  → avanti  (accelerazione longitudinale positiva = accelerazione)
@@ -25,9 +39,9 @@
 #define IMU_SCL_PIN 9
 #endif
 
-// Indirizzo I2C MPU6500 (AD0 = GND -> 0x68, AD0 = VCC → 0x69)
+// Indirizzo I2C MPU6500 (SA0 = GND -> 0x6A, SA0 = VCC → 0x6B)
 #ifndef IMU_I2C_ADDR
-#define IMU_I2C_ADDR 0x68
+#define IMU_I2C_ADDR 0x6A
 #endif
 
 // ---------------------------------------------------------------------------
@@ -35,18 +49,23 @@
 // ---------------------------------------------------------------------------
 struct ImuData {
     // Accelerazioni dinamiche (gravità rimossa, filtrate) - in G
-    float lonAcc = 0.0f; // longitudinale: positivo = accelerazione in avanti
-    float latAcc   = 0.0f;   // laterale:      positivo = forza verso destra (curva sx)
+    float lonAcc = 0.0f;     // longitudinale: positivo = accelerazione in avanti
+    float latAcc = 0.0f;     // laterale:      positivo = forza verso destra (curva sx)
  
     // Orientamento assoluto stimato dal filtro di Madgwick — in gradi
     float roll     = 0.0f;   // rollio:    positivo = lato destro in basso
     float pitch    = 0.0f;   // beccheggio: positivo = muso in alto
-    float slope    = 0.0f;   // pendenza longitudinale stimata (≈ pitch a vel. costante)
+    
+    // Pendenza stimata (lenta, affidabile) e relativa confidenza
+    float slope           = 0.0f;   // pendenza longitudinale (in gradi sessagesimali)
+    float slopeConfidence = 0.0f;   // 0 = inaffidabile, 1 = molto affidabile
  
-    // Accelerazioni raw (con gravità) — utili per debug
-    float rawAccX  = 0.0f;
-    float rawAccY  = 0.0f;
-    float rawAccZ  = 0.0f;
+    // Flag quasi-statico (veicolo fermo o velocità costante su piano)
+    bool quasiStatic = false;
+
+    // Dati raw calibrati (utili per debug)
+    float accX_cal = 0.0f, accY_cal = 0.0f, accZ_cal = 0.0f;
+    float gyrX_cal = 0.0f, gyrY_cal = 0.0f, gyrZ_cal = 0.0f;
  
     bool  valid    = false;  // false finché il sensore non è inizializzato
 };
@@ -55,12 +74,12 @@ struct ImuData {
 // API pubblica
 // ---------------------------------------------------------------------------
 
-// Inizializza I2C e MPU6500. Esegue calibrazione offset giroscopio (1 secondo).
+// Inizializza I2C e ISM330DHCX. Esegue calibrazione statica (1 secondo).
 // Restituisce true se il sensore risponde correttamente.
 bool imuInit();
 
-// Legge nuovi dati dal MPU6500, aggiorna il filtro di Madgwick.
-// Chiamare nel loop() il più frequentemente possibile (idealmente ogni 2-5ms).
+// Legge nuovi dati dalla FIFO, aggiorna il filtro di Madgwick.
+// Chiamare nel loop() - la frequenza di lettura non è critica grazie alla FIFO.
 void imuUpdate();
 
 // Restituisce una copia thread-safe dei dati IMU correnti.

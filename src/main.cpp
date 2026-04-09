@@ -99,7 +99,7 @@ void loop() {
   gnssUpdate();
   obd2Update();
   webServerHandle();
-  imuUpdate(); // chiamato ad ogni loop - più frequente = migliore stima
+  imuUpdate(); // lettura FIFO + filtro
 
   // ── ATTESA FIX ────────────────────────────────────────────────────────────
   if (sysState == SYS_WAITING_FIX) {
@@ -136,28 +136,13 @@ void loop() {
   GnssData g = gnssGetData();
   ImuData   imu = imuGetData();
 
-  // ── Flag affidabilità pendenza ────────────────────────────────────────────
-  // Calcola |dv/dt| dalla velocità OBD2 tra due campioni consecutivi.
-  // LOG_INTERVAL_MS = 500ms → dt = 0.5s
-  // Soglia 0.5 m/s² ≈ 0.14G: sotto questa soglia la distorsione del pitch
-  // per effetto inerziale è < 8°, accettabile come stima pendenza.
-  // Conversione: OBD2 speed è in km/h → dividi per 3.6 per avere m/s.
-  static float prevSpeedMs = 0.0f;
-  float currSpeedMs   = vehicleData.speed / 3.6f;
-  float accelEstMs2   = fabsf(currSpeedMs - prevSpeedMs) / (LOG_INTERVAL_MS / 1000.0f);
-  prevSpeedMs         = currSpeedMs;
- 
-  // Soglia 0.5 m/s²: corrisponde a ~0.05G, distorsione pitch < 3°
-  static const float SLOPE_RELIABLE_THRESHOLD_MS2 = 0.5f;
-  uint8_t slopeReliable = (accelEstMs2 < SLOPE_RELIABLE_THRESHOLD_MS2) ? 1 : 0;
-
   sdWriteRow(ts,
     g.lat, g.lon, g.altMeters,
     g.satellites, g.hdop,
     vehicleData.speed,
     imu.lonAcc,  imu.latAcc,
     imu.roll,    imu.pitch,
-    imu.slope,   slopeReliable,
+    imu.slope,   imu.slopeConfidence,
     vehicleData.rpm,
     vehicleData.load,
     vehicleData.throttle

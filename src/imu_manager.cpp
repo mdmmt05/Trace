@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // imu_manager.cpp
-// Lettura MPU6500 via I2C + filtro di Madgwick per fusione acc+gyro.
+// Lettura ISM330DHCX via I2C, filtro di Madgwick adattivo per fusione acc+gyro e stima slope dedicata.
 //
 // Il filtro di Madgwick è un algoritmo AHRS (Attitude and Heading Reference
 // System) che fonde accelerometro e giroscopio per stimare l'orientamento
@@ -20,46 +20,85 @@
 #include <math.h>
 
 // ---------------------------------------------------------------------------
-// Registri MPU6500
+// Registri ISM330DHCX
 // ---------------------------------------------------------------------------
-#define MPU_REG_SMPLRT_DIV      0x19
-#define MPU_REG_CONFIG          0x1A
-#define MPU_REG_GYRO_CONFIG     0x1B
-#define MPU_REG_ACCEL_CONFIG    0x1C
-#define MPU_REG_ACCEL_CONFIG2   0x1D
-#define MPU_REG_INT_ENABLE      0x38
-#define MPU_REG_ACCEL_XOUT_H    0x3B   // 6 byte accel (X H/L, Y H/L, Z H/L)
-#define MPU_REG_TEMP_OUT_H      0x41
-#define MPU_REG_GYRO_XOUT_H     0x43   // 6 byte gyro  (X H/L, Y H/L, Z H/L)
-#define MPU_REG_PWR_MGMT_1      0x6B
-#define MPU_REG_WHO_AM_I        0x75
- 
-#define MPU_WHO_AM_I_VAL        0x70   // MPU6500 risponde 0x70
+#define ISM330_WHO_AM_I        0x0F   // atteso 0x6B
+#define ISM330_CTRL1_XL        0x10   // Acc ODR, FS, LPF
+#define ISM330_CTRL2_G         0x11   // Gyro ODR, FS
+#define ISM330_CTRL3_C         0x12   // Interfaccia, reset
+#define ISM330_CTRL4_C         0x13   // FIFO enable, LPF2
+#define ISM330_CTRL5_C         0x14   // Routing interrupt
+#define ISM330_CTRL6_C         0x15   // Gyro LPF, user offset
+#define ISM330_CTRL7_G         0x16   // Gyro high-pass
+#define ISM330_CTRL8_XL        0x17   // Acc LPF2, input composite
+#define ISM330_CTRL9_XL        0x18   // Acc axis enable
+#define ISM330_CTRL10_C        0x19   // Gyro axis enable
 
-// Scala accelerometro: ±4G → sensibilità 8192 LSB/G
-// (±2G = 16384, ±4G = 8192, ±8G = 4096, ±16G = 2048)
-// ±4G è il range ottimale per un'auto: cattura frenate brusche senza saturare
-#define ACCEL_RANGE_4G          0x08   // bit[4:3] = 01
-#define ACCEL_SCALE             8192.0f
+#define ISM330_FIFO_CTRL1      0x07   // Watermark level
+#define ISM330_FIFO_CTRL2      0x08   // FIFO mode, watermark interrupt
+#define ISM330_FIFO_CTRL3      0x09   // Batch decimation
+#define ISM330_FIFO_CTRL4      0x0A   // FIFO mode selection
+#define ISM330_FIFO_STATUS1    0x0B   // FIFO level (low byte)
+#define ISM330_FIFO_STATUS2    0x0C   // FIFO level (high byte, overrun)
+#define ISM330_FIFO_DATA_OUT_L 0x3E   // FIFO output (low)
+#define ISM330_FIFO_DATA_OUT_H 0x3F   // FIFO output (high)
 
-// Scala giroscopio: ±500 °/s → sensibilità 65.5 LSB/(°/s)
-// Sufficiente per auto: anche in curva veloce raramente si superano 100°/s
-#define GYRO_RANGE_500DPS       0x08   // bit[4:3] = 01
-#define GYRO_SCALE              65.5f
+#define ISM330_STATUS_REG      0x1E   // Status (FIFO threshold, overrun)
+
+#define ISM330_OUTX_L_G        0x22   // Giroscopio X low (per debug)
+#define ISM330_OUTX_L_A        0x28   // Accelerometro X low
+
+// Valore WHO_AM_I atteso
+#define ISM330_WHO_AM_I_VAL    0x6B
+
+// ===========================================================================
+// Configurazioni sensore – scelte per automotive (robustezza > max Fs)
+// ===========================================================================
+// Accelerometro: ±4G, ODR = 208 Hz, LPF2 = 50 Hz
+// ±4G è sufficiente per frenate/accelerazioni tipiche (max ~1.2G su strada)
+// ODR 208 Hz permette di catturare dinamiche del veicolo senza sovraccaricare FIFO
+#define ACC_ODR_208HZ          (0x04 << 4)   // CTRL1_XL[7:4] = 0100
+#define ACC_FS_4G              (0x02 << 2)   // CTRL1_XL[3:2] = 10 (±4G)
+#define ACC_LPF2_50HZ          (0x01 << 0)   // CTRL1_XL[1:0] = 01 (filtro banda 50 Hz)
+#define ACC_CONFIG             (ACC_ODR_208HZ | ACC_FS_4G | ACC_LPF2_50HZ)
+
+// Giroscopio: ±500 °/s, ODR = 208 Hz, LPF1 = 50 Hz
+// ±500 °/s: anche in curva estrema (autostrada) <200 °/s, range ampio senza clipping
+#define GYR_ODR_208HZ          (0x04 << 4)   // CTRL2_G[7:4] = 0100
+#define GYR_FS_500DPS          (0x00 << 2)   // CTRL2_G[3:2] = 00 (±500 °/s)
+#define GYR_LPF1_50HZ          (0x01 << 0)   // CTRL2_G[1:0] = 01 (filtro 50 Hz)
+#define GYR_CONFIG             (GYR_ODR_208HZ | GYR_FS_500DPS | GYR_LPF1_50HZ)
+
+// Fattori di scala per conversioni in unità fisiche
+#define ACC_SCALE_4G           16384.0f   // ±4G → 16384 LSB/G
+#define GYR_SCALE_500DPS       131.0f     // ±500 °/s → 131 LSB/(°/s)
+
+// ===========================================================================
+// FIFO – modalità continua, watermark 16 campioni
+// Ognuno dei 16 campioni è una coppia (acc + gyro) → 12 byte per campione
+// Totale lettura burst di 192 byte ogni volta, ben dentro i limiti I2C.
+// ===========================================================================
+#define FIFO_WATERMARK         16
+#define BYTES_PER_SAMPLE       12   // 6 byte acc + 6 byte gyro
+#define FIFO_BURST_SIZE        (FIFO_WATERMARK * BYTES_PER_SAMPLE)
 
 // ---------------------------------------------------------------------------
 // Parametri filtro di Madgwick
 // ---------------------------------------------------------------------------
 // Beta: guadagno del gradiente (trade-off velocità convergenza / rumore)
 // 0.033 = valore raccomandato da Madgwick per AHRS a 6DOF
-// Aumentare (es 0.1) se l'orientamento risponde lentamente agli input
-// Diminuire (es 0.01) se l'output è troppo rumoroso
-#define MADGWICK_BETA           0.033f
+#define MADGWICK_BASE_BETA     0.033f   // beta base (raccomandato da Madgwick)
+#define ACCEL_WEIGHT_MIN       0.1f     // peso minimo dell'accelerometro in alta dinamica
+#define ACCEL_WEIGHT_MAX       1.0f     // peso massimo (quasi-statico)
+#define GYRO_MAG_THRESH        15.0f    // °/s – sopra questa soglia riduci peso accelerometro
+#define ACC_MAG_1G_TOL         0.15f    // tolleranza per modulo accelerazione vicino a 1G
  
-// Frequenza di campionamento target (Hz) — usata per l'integrazione del gyro
-// Il loop reale misura il dt effettivo; questo è solo il valore iniziale
-#define SAMPLE_FREQ_HZ          200.0f
- 
+// ===========================================================================
+// Stima slope lenta – costante di tempo 2.0 secondi
+// ===========================================================================
+#define SLOPE_TC_QUASI_STATIC  2.0f      // aggiornamento rapido in quasi-statico
+#define SLOPE_TC_DYNAMIC       10.0f     // aggiornamento molto lento in dinamica
+
 // ---------------------------------------------------------------------------
 // Stato interno — tutto privato al modulo
 // ---------------------------------------------------------------------------
@@ -67,77 +106,152 @@
 // Quaternione di orientamento Madgwick (normalizzato, w=1 = identità)
 static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
  
-// Offset giroscopio (calibrazione statica all'avvio)
-static float _gyroOffX = 0.0f, _gyroOffY = 0.0f, _gyroOffZ = 0.0f;
- 
-// Timing
-static unsigned long _lastUpdateUs = 0;
- 
-// Dati correnti (aggiornati da imuUpdate, letti da imuGetData)
-static ImuData _data;
- 
-static bool _ready = false;
+static float gyroBiasX = 0.0f, gyroBiasY = 0.0f, gyroBiasZ = 0.0f;
+static float accBiasX = 0.0f, accBiasY = 0.0f, accBiasZ = 0.0f;
+static float accScaleX = 1.0f, accScaleY = 1.0f, accScaleZ = 1.0f;
+
+static bool ready = false;
+static ImuData imuData;   // dati più recenti
+
+// Variabili per la slope lenta
+static float slopeFiltered = 0.0f;
+static unsigned long lastSlopeUpdate = 0;
+
+// Supporto FIFO
+static uint8_t fifoBuffer[FIFO_BURST_SIZE];
+static float odrHz = 208.0f;        // ODR effettivo (Hz)
+static float sampleDt = 1.0f / odrHz;  // dt nominale tra campioni FIFO
 
 // ---------------------------------------------------------------------------
 // Helpers I2C
 // ---------------------------------------------------------------------------
-static void _writeReg(uint8_t reg, uint8_t val) {
+static bool writeReg(uint8_t reg, uint8_t val) {
     Wire.beginTransmission(IMU_I2C_ADDR);
     Wire.write(reg);
     Wire.write(val);
-    Wire.endTransmission();
+    return (Wire.endTransmission() == 0);
 }
 
-static uint8_t _readReg(uint8_t reg) {
+static uint8_t readReg(uint8_t reg) {
     Wire.beginTransmission(IMU_I2C_ADDR);
     Wire.write(reg);
-    Wire.endTransmission(false);
+    if (Wire.endTransmission(false) != 0) return 0xFF;
     Wire.requestFrom((uint8_t)IMU_I2C_ADDR, (uint8_t)1);
     return Wire.available() ? Wire.read() : 0xFF;
 }
 
 // Legge `len` byte consecutivi a partire da `reg` in `buf`
-static bool _readRegs(uint8_t reg, uint8_t* buf, uint8_t len) {
+static bool readRegs(uint8_t reg, uint8_t* buf, size_t len) {
     Wire.beginTransmission(IMU_I2C_ADDR);
     Wire.write(reg);
     if (Wire.endTransmission(false) != 0) return false;
-    Wire.requestFrom((uint8_t)IMU_I2C_ADDR, len);
+    Wire.requestFrom(IMU_I2C_ADDR, len);
     if (Wire.available() < len) return false;
-    for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+    for (size_t i = 0; i < len; i++) buf[i] = Wire.read();
     return true;
 }
 
 // ---------------------------------------------------------------------------
-// Lettura raw accelerometro e giroscopio
-// Formato: 3 registri H/L da 16 bit big-endian, complemento a 2
+// Calibrazione statica (avvio)
 // ---------------------------------------------------------------------------
-static bool _readRawSensors(float& ax, float& ay, float& az,
+static void calibrateSensors(){
+    const int samples = 500;
+    double sumGx = 0, sumGy = 0, sumGz = 0;
+    double sumAx = 0, sumAy = 0, sumAz = 0;
+
+    Serial.print("[IMU] Calibrazione statica (gyro + acc bias)...");
+    for (int i = 0; i < samples; i++) {
+        // Legge raw (senza offset) – registri OUTX_L_G e OUTX_L_A
+        uint8_t buf[12];
+        if (!readRegs(ISM330_OUTX_L_G, buf, 12)) {
+            i--;
+            delay(2);
+            continue;
+        }
+        int16_t rawGx = (int16_t)((buf[1] << 8) | buf[0]);
+        int16_t rawGy = (int16_t)((buf[3] << 8) | buf[2]);
+        int16_t rawGz = (int16_t)((buf[5] << 8) | buf[4]);
+        int16_t rawAx = (int16_t)((buf[7] << 8) | buf[6]);
+        int16_t rawAy = (int16_t)((buf[9] << 8) | buf[8]);
+        int16_t rawAz = (int16_t)((buf[11] << 8) | buf[10]);
+
+        sumGx += rawGx; sumGy += rawGy; sumGz += rawGz;
+        sumAx += rawAx; sumAy += rawAy; sumAz += rawAz;
+
+        delay(2);
+        if (i % 50 == 0) Serial.print(".");
+    }
+    Serial.println(" OK");
+
+    // Offset giroscopio (LSB)
+    gyroBiasX = (float)(sumGx / samples);
+    gyroBiasY = (float)(sumGy / samples);
+    gyroBiasZ = (float)(sumGz / samples);
+
+    // Offset accelerometro (LSB) - presuppone sensore fermo e montaggio orizzontale
+    // La gravità attesa è +-1G sull'asse Z (convenzione sensore: Z+ verso l'alto)
+    //Quindi bias = media - valore atteso (0 su X/Y, +-1G su Z)
+    float expectedAx = 0.0f, expectedAy = 0.0f, expectedAz = ACC_SCALE_4G;
+    accBiasX = (float)(sumAx / samples) - expectedAx;
+    accBiasY = (float)(sumAy / samples) - expectedAy;
+    accBiasZ = (float)(sumAz / samples) - expectedAz;
+
+    // Scale factor dell'accelerometro: correzione grossolana basata sul modulo
+    // (opzionale - migliora la precisione statica)
+    float rawMag = sqrtf( (sumAx/samples)*(sumAx/samples) +
+                          (sumAy/samples)*(sumAy/samples) +
+                          (sumAz/samples)*(sumAz/samples) );
+    float expectedMag = ACC_SCALE_4G;   // 1G espresso in LSB
+    float scaleCorrection = expectedMag / rawMag;
+    accScaleX = scaleCorrection;
+    accScaleY = scaleCorrection;
+    accScaleZ = scaleCorrection;
+
+    Serial.printf("[IMU] Gyro bias: %.1f, %.1f, %.1f LSB\n", gyroBiasX, gyroBiasY, gyroBiasZ);
+    Serial.printf("[IMU] Acc bias: %.1f, %.1f, %.1f LSB  scale: %.3f\n", accBiasX, accBiasY, accBiasZ, scaleCorrection);
+}
+
+// ---------------------------------------------------------------------------
+// Applica calibrazione ai raw LSB, restituisce valori fisici
+// ---------------------------------------------------------------------------
+static void applyCalibration(int16_t rawAx, int16_t rawAy, int16_t rawAz,
+                             int16_t rawGx, int16_t rawGy, int16_t rawGz,
+                             float& ax, float& ay, float& az,
                              float& gx, float& gy, float& gz) {
-    uint8_t buf[14];  // ACCEL_OUT(6) + TEMP(2) + GYRO_OUT(6)
-    if (!_readRegs(MPU_REG_ACCEL_XOUT_H, buf, 14)) return false;
- 
-    int16_t rawAX = (int16_t)((buf[0]  << 8) | buf[1]);
-    int16_t rawAY = (int16_t)((buf[2]  << 8) | buf[3]);
-    int16_t rawAZ = (int16_t)((buf[4]  << 8) | buf[5]);
-    // buf[6..7] = temperatura — ignorata
-    int16_t rawGX = (int16_t)((buf[8]  << 8) | buf[9]);
-    int16_t rawGY = (int16_t)((buf[10] << 8) | buf[11]);
-    int16_t rawGZ = (int16_t)((buf[12] << 8) | buf[13]);
- 
-    // Converti in unità fisiche
-    ax = (float)rawAX / ACCEL_SCALE;   // G
-    ay = (float)rawAY / ACCEL_SCALE;   // G
-    az = (float)rawAZ / ACCEL_SCALE;   // G
- 
-    gx = (float)rawGX / GYRO_SCALE;    // °/s
-    gy = (float)rawGY / GYRO_SCALE;    // °/s
-    gz = (float)rawGZ / GYRO_SCALE;    // °/s
- 
-    return true;
+    // Accelerometro: sottrai bias, scala, converti in G
+    ax = ((float)rawAx - accBiasX) * accScaleX / ACC_SCALE_4G;
+    ay = ((float)rawAy - accBiasY) * accScaleY / ACC_SCALE_4G;
+    az = ((float)rawAz - accBiasZ) * accScaleZ / ACC_SCALE_4G;
+
+    // Giroscopio: sottrai bias, converti in °/s
+    gx = ((float)rawGx - gyroBiasX) / GYR_SCALE_500DPS;
+    gy = ((float)rawGy - gyroBiasY) / GYR_SCALE_500DPS;
+    gz = ((float)rawGz - gyroBiasZ) / GYR_SCALE_500DPS;
 }
 
 // ---------------------------------------------------------------------------
-// Filtro di Madgwick — implementazione IMU (solo acc + gyro, no magnetometro)
+// Lettura batch dalla FIFO
+// ---------------------------------------------------------------------------
+static int readFifoBatch(uint8_t* buffer,  size_t maxLen) {
+    uint16_t level = 0;
+    uint8_t status = readReg(ISM330_STATUS_REG);
+    if (status & 0x01) {  // FIFO threshold reached
+        // Legge livello FIFO (16 bit)
+        uint8_t low = readReg(ISM330_FIFO_STATUS1);
+        uint8_t high = readReg(ISM330_FIFO_STATUS2) & 0x07;
+        level = (high << 8) | low;
+    }
+    if (level == 0) return 0;
+    if (level > FIFO_WATERMARK) level = FIFO_WATERMARK;
+    size_t bytesToRead = level * BYTES_PER_SAMPLE;
+    if (bytesToRead > maxLen) bytesToRead = maxLen;
+
+    if (!readRegs(ISM330_FIFO_DATA_OUT_L, buffer, bytesToRead)) return 0;
+    return bytesToRead;
+}
+
+// ---------------------------------------------------------------------------
+// Filtro di Madgwick (con beta adattivo) — implementazione IMU (solo acc + gyro, no magnetometro)
 //
 // Aggiorna il quaternione globale q0,q1,q2,q3 con i nuovi campioni.
 // Input:  accelerometro in G, giroscopio in °/s, dt in secondi
@@ -147,78 +261,76 @@ static bool _readRawSensors(float& ax, float& ay, float& az,
 // Questa implementazione è matematicamente equivalente alla reference C
 // ma riscritta per chiarezza e senza dipendenze esterne.
 // ---------------------------------------------------------------------------
-static void _madgwickUpdate(float ax, float ay, float az,
-                             float gx, float gy, float gz,
-                             float dt) {
+static void madgwickUpdateAdaptive(float ax, float ay, float az,
+                                   float gx, float gy, float gz,
+                                   float dt) {
+    
+    // Calcola fattore di confidenza per l'accelerometro
+    float accelMag = sqrtf(ax*ax + ay*ay + az*az);
+    float gyroMag = sqrtf(gx*gx + gy*gy + gz*gz);
+
+    // Quanto la magnitudo accelerazione è vicina a 1G?
+    float accWeight = 1.0f - fabsf(accelMag - 1.0f) / ACC_MAG_1G_TOL;
+    accWeight = constrain(accWeight, 0.0f, 1.0f);
+
+    // Riduci peso se giroscopio è molto attivo (alta dinamica angolare)
+    float gyroFactor = 1.0f - constrain(gyroMag / GYRO_MAG_THRESH, 0.0f, 1.0f);
+    float finalWeight = accWeight * gyroFactor;
+    finalWeight = ACCEL_WEIGHT_MIN + finalWeight * (ACCEL_WEIGHT_MAX - ACCEL_WEIGHT_MIN);
+    float beta = MADGWICK_BASE_BETA * finalWeight;
+
     // Converti giroscopio in rad/s
     const float DEG2RAD = M_PI / 180.0f;
-    gx *= DEG2RAD;
-    gy *= DEG2RAD;
-    gz *= DEG2RAD;
- 
-    float recipNorm;
-    float s0, s1, s2, s3;
+    gx *= DEG2RAD; gy *= DEG2RAD; gz *= DEG2RAD;
+
+    // Algoritmo di Madgwick (standard)
     float qDot0, qDot1, qDot2, qDot3;
-    float _2q0, _2q1, _2q2, _2q3;
-    float _4q0, _4q1, _4q2;
-    float _8q1, _8q2;
+    float s0, s1, s2, s3;
+    float recipNorm;
+    float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2, _8q1, _8q2;
     float q0q0, q1q1, q2q2, q3q3;
- 
-    // Derivata del quaternione dall'integrazione del giroscopio
-    qDot0 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-    qDot1 = 0.5f * ( q0 * gx + q2 * gz - q3 * gy);
-    qDot2 = 0.5f * ( q0 * gy - q1 * gz + q3 * gx);
-    qDot3 = 0.5f * ( q0 * gz + q1 * gy - q2 * gx);
- 
-    // Applica correzione gradiente solo se l'accelerometro non è nullo
-    float accNorm = sqrtf(ax * ax + ay * ay + az * az);
-    if (accNorm > 0.0f) {
-        // Normalizza accelerometro
-        recipNorm = 1.0f / accNorm;
-        ax *= recipNorm;
-        ay *= recipNorm;
-        az *= recipNorm;
- 
-        // Pre-calcola termini quadratici (riduce moltiplicazioni)
-        _2q0 = 2.0f * q0; _2q1 = 2.0f * q1;
-        _2q2 = 2.0f * q2; _2q3 = 2.0f * q3;
-        _4q0 = 4.0f * q0; _4q1 = 4.0f * q1; _4q2 = 4.0f * q2;
-        _8q1 = 8.0f * q1; _8q2 = 8.0f * q2;
-        q0q0 = q0 * q0; q1q1 = q1 * q1;
-        q2q2 = q2 * q2; q3q3 = q3 * q3;
- 
-        // Funzione gradiente (obiettivo: allineare il vettore z con la gravità)
-        // Derivata dell'errore di orientamento rispetto al quaternione
-        s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
-        s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay
-             - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
-        s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay
-             - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
-        s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
- 
-        // Normalizza il gradiente
+
+    // Derivata quaternione dal giroscopio
+    qDot0 = 0.5f * (-q1*gx - q2*gy - q3*gz);
+    qDot1 = 0.5f * ( q0*gx + q2*gz - q3*gy);
+    qDot2 = 0.5f * ( q0*gy - q1*gz + q3*gx);
+    qDot3 = 0.5f * ( q0*gz + q1*gy - q2*gx);
+
+    // Correzione accelerometro (solo se il vettore non è nullo)
+    float normAcc = sqrtf(ax*ax + ay*ay + az*az);
+    if (normAcc > 0.0f && finalWeight > 0.01f) {
+        ax /= normAcc; ay /= normAcc; az /= normAcc;
+
+        _2q0 = 2.0f*q0; _2q1 = 2.0f*q1; _2q2 = 2.0f*q2; _2q3 = 2.0f*q3;
+        _4q0 = 4.0f*q0; _4q1 = 4.0f*q1; _4q2 = 4.0f*q2;
+        _8q1 = 8.0f*q1; _8q2 = 8.0f*q2;
+        q0q0 = q0*q0; q1q1 = q1*q1; q2q2 = q2*q2; q3q3 = q3*q3;
+
+        s0 = _4q0*q2q2 + _2q2*ax + _4q0*q1q1 - _2q1*ay;
+        s1 = _4q1*q3q3 - _2q3*ax + 4.0f*q0q0*q1 - _2q0*ay - _4q1 + _8q1*q1q1 + _8q1*q2q2 + _4q1*az;
+        s2 = 4.0f*q0q0*q2 + _2q0*ax + _4q2*q3q3 - _2q3*ay - _4q2 + _8q2*q1q1 + _8q2*q2q2 + _4q2*az;
+        s3 = 4.0f*q1q1*q3 - _2q1*ax + 4.0f*q2q2*q3 - _2q2*ay;
+
         recipNorm = 1.0f / sqrtf(s0*s0 + s1*s1 + s2*s2 + s3*s3);
-        s0 *= recipNorm; s1 *= recipNorm;
-        s2 *= recipNorm; s3 *= recipNorm;
- 
-        // Applica la correzione alla derivata del quaternione
-        qDot0 -= MADGWICK_BETA * s0;
-        qDot1 -= MADGWICK_BETA * s1;
-        qDot2 -= MADGWICK_BETA * s2;
-        qDot3 -= MADGWICK_BETA * s3;
+        s0 *= recipNorm; s1 *= recipNorm; s2 *= recipNorm; s3 *= recipNorm;
+
+        qDot0 -= beta * s0;
+        qDot1 -= beta * s1;
+        qDot2 -= beta * s2;
+        qDot3 -= beta * s3;
     }
- 
-    // Integra: q_new = q_old + qDot * dt
+
+    // Integra
     q0 += qDot0 * dt;
     q1 += qDot1 * dt;
     q2 += qDot2 * dt;
     q3 += qDot3 * dt;
- 
-    // Rinormalizza il quaternione (mantiene |q| = 1)
+
+    // Normalizza
     recipNorm = 1.0f / sqrtf(q0*q0 + q1*q1 + q2*q2 + q3*q3);
-    q0 *= recipNorm; q1 *= recipNorm;
-    q2 *= recipNorm; q3 *= recipNorm;
+    q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
 }
+
 
 // ---------------------------------------------------------------------------
 // Conversione quaternione → angoli di Eulero (roll, pitch)
@@ -226,7 +338,7 @@ static void _madgwickUpdate(float ax, float ay, float az,
 // Convenzione ZYX (yaw-pitch-roll), standard aeronautico / automotive.
 // Restituisce gradi.
 // ---------------------------------------------------------------------------
-static void _quaternionToEuler(float& roll, float& pitch) {
+static void quatToRollPitch(float& roll, float& pitch) {
     // Roll (rotazione attorno X): atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1²+q2²))
     roll  = atan2f(2.0f * (q0 * q1 + q2 * q3),
                    1.0f - 2.0f * (q1 * q1 + q2 * q2)) * (180.0f / M_PI);
@@ -234,8 +346,7 @@ static void _quaternionToEuler(float& roll, float& pitch) {
     // Pitch (rotazione attorno Y): asin(2*(q0*q2 - q3*q1))
     // Clamp a [-1, 1] per evitare NaN da asinf su valori fuori range per errori numerici
     float sinp = 2.0f * (q0 * q2 - q3 * q1);
-    sinp = (sinp >  1.0f) ?  1.0f : sinp;
-    sinp = (sinp < -1.0f) ? -1.0f : sinp;
+    sinp = constrain(sinp, -1.0f, 1.0f);
     pitch = asinf(sinp) * (180.0f / M_PI);
 }
 
@@ -247,8 +358,8 @@ static void _quaternionToEuler(float& roll, float& pitch) {
 // Sottraendo il vettore gravità nel frame mondo otteniamo l'accelerazione
 // dinamica (quella causata dal moto del veicolo).
 // ---------------------------------------------------------------------------
-static void _removeGravity(float ax, float ay, float az,
-                            float& lonOut, float& latOut) {
+static void removeGravity(float ax, float ay, float az,
+                          float& lonAcc, float& latAcc) {
     // Ruota il vettore accelerazione dal frame sensore al frame mondo
     // usando la matrice di rotazione derivata dal quaternione.
     // Solo le componenti X e Y ci interessano (orizzontali nel frame mondo).
@@ -270,151 +381,169 @@ static void _removeGravity(float ax, float ay, float az,
     // perché la rotazione ha già rimosso la componente gravitazionale
     // dal vettore accelerometro (la gravità nel frame mondo è solo Z).
  
-    lonOut =  worldX;   // avanti positivo = accelerazione
-    latOut = -worldY;   // convenzione: positivo = forza verso destra (curva sx)
+    lonAcc =  worldX;   // avanti positivo = accelerazione
+    latAcc = -worldY;   // convenzione: positivo = forza verso destra (curva sx)
 }
 
 // ---------------------------------------------------------------------------
-// Calibrazione offset giroscopio
-// Media N campioni a sensore fermo → offset da sottrarre ad ogni lettura
+// Rilevazione quasi‑statico (solo sensore)
 // ---------------------------------------------------------------------------
-static void _calibrateGyro(int numSamples = 500) {
-    double sumX = 0, sumY = 0, sumZ = 0;
-    float ax, ay, az, gx, gy, gz;
- 
-    Serial.print("[IMU] Calibrazione giroscopio");
-    for (int i = 0; i < numSamples; i++) {
-        if (_readRawSensors(ax, ay, az, gx, gy, gz)) {
-            sumX += gx; sumY += gy; sumZ += gz;
-        }
-        if (i % 50 == 0) Serial.print(".");
-        delay(2);
+static bool detectQuasiStatic(float ax, float ay, float az,
+                              float gx, float gy, float gz) {
+    float accMag = sqrtf(ax*ax + ay*ay + az*az);
+    float gyroMag = sqrtf(gx*gx + gy*gy + gz*gz);
+    return (fabsf(accMag - 1.0f) < 0.1f) && (gyroMag < 5.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Stima slope dedicata (filtro IIR con costante di tempo variabile)
+// ---------------------------------------------------------------------------
+static void updateSlopeEstimator(float currentPitch, bool quasiStatic, float dt) {
+    float timeConstant = quasiStatic ? SLOPE_TC_QUASI_STATIC : SLOPE_TC_DYNAMIC;
+    float alpha = dt / (dt + timeConstant);
+    alpha = constrain(alpha, 0.0f, 0.1f);  // evita aggiornamenti troppo bruschi
+    slopeFiltered = slopeFiltered * (1.0f - alpha) + currentPitch * alpha;
+    imuData.slope = slopeFiltered;
+}
+
+// ---------------------------------------------------------------------------
+// Inizializzazione hardware ISM330DHCX
+// ---------------------------------------------------------------------------
+static bool initISM330() {
+    // Reset del chip
+    writeReg(ISM330_CTRL3_C, 0x01);   // SW_RESET
+    delay(50);
+    // Verifica WHO_AM_I
+    if (readReg(ISM330_WHO_AM_I) != ISM330_WHO_AM_I_VAL) {
+        Serial.printf("[IMU] WHO_AM_I errato – atteso 0x%02X\n", ISM330_WHO_AM_I_VAL);
+        return false;
     }
-    Serial.println(" OK");
- 
-    _gyroOffX = (float)(sumX / numSamples);
-    _gyroOffY = (float)(sumY / numSamples);
-    _gyroOffZ = (float)(sumZ / numSamples);
- 
-    Serial.printf("[IMU] Offset gyro: %.3f  %.3f  %.3f °/s\n",
-                  _gyroOffX, _gyroOffY, _gyroOffZ);
+
+    // Configura blocchi: acc e gyro abilitati, modalità continua
+    writeReg(ISM330_CTRL1_XL, ACC_CONFIG);
+    writeReg(ISM330_CTRL2_G,  GYR_CONFIG);
+    writeReg(ISM330_CTRL3_C, 0x44);   // IF_INC = 1, BDU = 1, auto-increment, big-endian disabilitato
+    writeReg(ISM330_CTRL4_C, 0x08);   // FIFO enable
+    writeReg(ISM330_CTRL6_C, 0x00);   // gyro LPF2 disabilitato
+    writeReg(ISM330_CTRL7_G, 0x00);   // gyro HPF disabilitato
+    writeReg(ISM330_CTRL8_XL, 0x00);
+    writeReg(ISM330_CTRL9_XL, 0x38);  // acc X,Y,Z abilitati
+    writeReg(ISM330_CTRL10_C, 0x38);  // gyro X,Y,Z abilitati
+
+    // Configura FIFO: modalità continua, watermark a FIFO_WATERMARK
+    writeReg(ISM330_FIFO_CTRL1, (uint8_t)(FIFO_WATERMARK & 0xFF));
+    writeReg(ISM330_FIFO_CTRL2, 0x06);   // FIFO continua (mode 6), watermark interrupt abilitato
+    writeReg(ISM330_FIFO_CTRL3, 0x00);
+    writeReg(ISM330_FIFO_CTRL4, 0x00);   // modalità FIFO (non Bypass)
+
+    delay(50);
+    return true;
 }
 
 // ===========================================================================
 // API PUBBLICA
-// ===========================================================================
- 
+// =========================================================================== 
 bool imuInit() {
     Wire.begin(IMU_SDA_PIN, IMU_SCL_PIN);
-    Wire.setClock(400000);   // 400kHz fast mode — MPU6500 supporta fino a 400kHz
- 
-    // Verifica WHO_AM_I
-    uint8_t whoami = _readReg(MPU_REG_WHO_AM_I);
-    if (whoami != MPU_WHO_AM_I_VAL) {
-        Serial.printf("[IMU] WHO_AM_I atteso 0x70, ricevuto 0x%02X — sensore non trovato\n", whoami);
+    Wire.setClock(400000);
+
+    if (!initISM330()) {
+        ready = false;
         return false;
     }
- 
-    // Wake up (di default il chip è in sleep dopo power-on)
-    _writeReg(MPU_REG_PWR_MGMT_1, 0x00);
-    delay(100);
- 
-    // Seleziona clock interno PLL (più stabile del clock RC interno)
-    _writeReg(MPU_REG_PWR_MGMT_1, 0x01);
-    delay(10);
- 
-    // Sample rate divider: SMPLRT_DIV = 0 → sample rate = Gyro Output Rate / 1
-    // Con DLPF attivo: Gyro Output Rate = 1kHz → sample rate = 1kHz
-    // Noi leggiamo a ~200Hz nel loop, il chip oversampling è ok
-    _writeReg(MPU_REG_SMPLRT_DIV, 0x00);
- 
-    // DLPF (Digital Low Pass Filter) = modalità 3 → fc = 41Hz acc / 42Hz gyro
-    // Filtra le vibrazioni meccaniche alte (motore, strada) — complementa la piastra anti-vib
-    // Modalità disponibili: 0=260Hz, 1=184Hz, 2=94Hz, 3=41Hz, 4=20Hz, 5=10Hz, 6=5Hz
-    _writeReg(MPU_REG_CONFIG, 0x03);
- 
-    // Accelerometro ±4G
-    _writeReg(MPU_REG_ACCEL_CONFIG, ACCEL_RANGE_4G);
- 
-    // Accelerometro DLPF: fc = 41Hz (registro separato su MPU6500)
-    _writeReg(MPU_REG_ACCEL_CONFIG2, 0x03);
- 
-    // Giroscopio ±500 °/s
-    _writeReg(MPU_REG_GYRO_CONFIG, GYRO_RANGE_500DPS);
- 
-    // Disabilita interrupt hardware (non li usiamo — polling nel loop)
-    _writeReg(MPU_REG_INT_ENABLE, 0x00);
- 
-    delay(50);  // Aspetta stabilizzazione DLPF
- 
-    // Calibrazione offset giroscopio (sensore DEVE essere fermo durante l'avvio)
-    _calibrateGyro(500);
- 
-    // Inizializza quaternione all'identità
+
+    // Calibrazione statica (sensore fermo!)
+    calibrateSensors();
+
+    // Reset stato filtro
     q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
-    _lastUpdateUs = micros();
- 
-    _data.valid = true;
-    _ready = true;
-    Serial.println("[IMU] MPU6500 inizializzato — filtro Madgwick attivo");
+    slopeFiltered = 0.0f;
+    lastSlopeUpdate = millis();
+
+    ready = true;
+    imuData.valid = true;
+    Serial.println("[IMU] ISM330DHCX inizializzato – FIFO + Madgwick adattivo");
     return true;
 }
 
-bool imuIsReady() { return _ready; }
+bool imuIsReady() { return ready; }
  
 void imuUpdate() {
-    if (!_ready) return;
- 
-    float ax, ay, az, gx, gy, gz;
-    if (!_readRawSensors(ax, ay, az, gx, gy, gz)) return;
- 
-    // Applica offset giroscopio
-    gx -= _gyroOffX;
-    gy -= _gyroOffY;
-    gz -= _gyroOffZ;
- 
-    // dt reale in secondi (evita drift da timing irregolare del loop)
-    unsigned long nowUs = micros();
-    float dt = (float)(nowUs - _lastUpdateUs) * 1e-6f;
-    _lastUpdateUs = nowUs;
- 
-    // Clamp dt: se il loop si è bloccato per >100ms ignora quel campione
-    // (evita salti di quaternione per interruzioni lunghe tipo SD write)
-    if (dt <= 0.0f || dt > 0.1f) return;
- 
-    // Aggiorna filtro di Madgwick
-    _madgwickUpdate(ax, ay, az, gx, gy, gz, dt);
- 
-    // Calcola angoli di Eulero
-    float roll, pitch;
-    _quaternionToEuler(roll, pitch);
- 
-    // Rimuovi gravità e ottieni accelerazioni dinamiche
-    float lonAcc, latAcc;
-    _removeGravity(ax, ay, az, lonAcc, latAcc);
- 
-    // Pendenza longitudinale: il pitch a velocità costante riflette
-    // l'inclinazione del terreno. In accelerazione/frenata è distorto
-    // dalla forza inerziale, ma è comunque utile come dato di contesto.
-    // Usiamo direttamente il pitch del filtro (già compensato dal gyro).
-    float slope = pitch;
- 
-    // Aggiorna struttura dati pubblica
-    _data.lonAcc  = lonAcc;
-    _data.latAcc  = latAcc;
-    _data.roll    = roll;
-    _data.pitch   = pitch;
-    _data.slope   = slope;
-    _data.rawAccX = ax;
-    _data.rawAccY = ay;
-    _data.rawAccZ = az;
-    _data.valid   = true;
- 
-    // Aggiorna anche shared_data per rgb_controller e web_server
-    vehicleData.lonAcc = lonAcc;
-    vehicleData.latAcc = latAcc;
+    if (!ready) return;
+
+    // Legge batch dalla FIFO
+    int bytesRead = readFifoBatch(fifoBuffer, FIFO_BURST_SIZE);
+    if (bytesRead < BYTES_PER_SAMPLE) return;  // nessun campione
+
+    int samplesInBatch = bytesRead / BYTES_PER_SAMPLE;
+    for (int i = 0; i < samplesInBatch; i++) {
+        uint8_t* ptr = &fifoBuffer[i * BYTES_PER_SAMPLE];
+        // Estrae raw (acc: 6 byte, gyro: 6 byte – little-endian)
+        int16_t rawAx = (int16_t)((ptr[1] << 8) | ptr[0]);
+        int16_t rawAy = (int16_t)((ptr[3] << 8) | ptr[2]);
+        int16_t rawAz = (int16_t)((ptr[5] << 8) | ptr[4]);
+        int16_t rawGx = (int16_t)((ptr[7] << 8) | ptr[6]);
+        int16_t rawGy = (int16_t)((ptr[9] << 8) | ptr[8]);
+        int16_t rawGz = (int16_t)((ptr[11] << 8) | ptr[10]);
+
+        float ax, ay, az, gx, gy, gz;
+        applyCalibration(rawAx, rawAy, rawAz, rawGx, rawGy, rawGz,
+                         ax, ay, az, gx, gy, gz);
+
+        // Salva raw calibrati per debug
+        imuData.accX_cal = ax;
+        imuData.accY_cal = ay;
+        imuData.accZ_cal = az;
+        imuData.gyrX_cal = gx;
+        imuData.gyrY_cal = gy;
+        imuData.gyrZ_cal = gz;
+
+        // Aggiorna filtro Madgwick con dt nominale
+        madgwickUpdateAdaptive(ax, ay, az, gx, gy, gz, sampleDt);
+
+        // Calcola roll/pitch
+        float roll, pitch;
+        quatToRollPitch(roll, pitch);
+        imuData.roll = roll;
+        imuData.pitch = pitch;
+
+        // Rimuovi gravità → accelerazioni dinamiche
+        float lonAcc, latAcc;
+        removeGravity(ax, ay, az, lonAcc, latAcc);
+        imuData.lonAcc = lonAcc;
+        imuData.latAcc = latAcc;
+
+        // Rileva quasi-statico
+        bool qs = detectQuasiStatic(ax, ay, az, gx, gy, gz);
+        imuData.quasiStatic = qs;
+
+        // Stima slope lenta (usa pitch corrente)
+        unsigned long now = micros();
+        float dtSlope = (now - lastSlopeUpdate) * 1e-6f;
+        if (dtSlope > 0.05f) {  // aggiorna slope al massimo 20 Hz
+            updateSlopeEstimator(pitch, qs, dtSlope);
+            lastSlopeUpdate = now;
+        }
+
+        // Confidence della slope: alta in quasi-statico, bassa in dinamica
+        float confidence = 0.0f;
+        if (qs) confidence = 0.9f;
+        else {
+            float gyroMag = sqrtf(gx*gx + gy*gy + gz*gz);
+            confidence = 1.0f - constrain(gyroMag / 30.0f, 0.0f, 0.8f);
+        }
+        imuData.slopeConfidence = confidence;
+    }
+
+    // Copia anche nella struttura condivisa (per altri moduli)
+    vehicleData.lonAcc = imuData.lonAcc;
+    vehicleData.latAcc = imuData.latAcc;
+    vehicleData.roll   = imuData.roll;
+    vehicleData.pitch  = imuData.pitch;
+    vehicleData.slope  = imuData.slope;
+    // opzionale: vehicleData potrebbe essere esteso con slopeConfidence e quasiStatic
 }
 
 ImuData imuGetData() {
-    return _data;   // copia per valore — thread-safe su ESP32 single-core loop
+    return imuData;   // copia per valore — thread-safe su ESP32 single-core loop
 }

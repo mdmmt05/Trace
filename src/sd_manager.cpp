@@ -34,7 +34,7 @@ bool sdOpenFile(const char* path) {
             "satelliti,hdop,"
             "velocita_obd_kmh,"
             "accel_lon_G,accel_lat_G,"
-            "roll_deg,pitch_deg,slope_deg,slope_reliable,"
+            "roll_deg,pitch_deg,slope_deg,slope_confidence,"
             "rpm,load_pct,throttle_pct"
         );
     }
@@ -51,28 +51,28 @@ void sdWriteRow(
     float lonAcc, float latAcc,
     float roll,   float pitch,
     float slope,
-    uint8_t slopeReliable,
+    float slopeConfidence,
     int rpm,
     int load,
     float throttle)
 {
     if (!dataFile) return;
 
-    dataFile.print(timestamp);        dataFile.print(",");
-    dataFile.print(lat, 6);           dataFile.print(",");
-    dataFile.print(lon, 6);           dataFile.print(",");
-    dataFile.print(alt, 1);           dataFile.print(",");
-    dataFile.print(satellites);       dataFile.print(",");
-    dataFile.print(hdop, 2);          dataFile.print(",");
-    dataFile.print(speedObd, 1);      dataFile.print(",");
-    dataFile.print(lonAcc, 3);        dataFile.print(",");
-    dataFile.print(latAcc, 3);        dataFile.print(",");
-    dataFile.print(roll, 1);          dataFile.print(",");
-    dataFile.print(pitch, 1);         dataFile.print(",");
-    dataFile.print(slope, 1);         dataFile.print(",");
-    dataFile.print(slopeReliable);    dataFile.print(",");
-    dataFile.print(rpm);              dataFile.print(",");
-    dataFile.print(load);             dataFile.print(",");
+    dataFile.print(timestamp);          dataFile.print(",");
+    dataFile.print(lat, 6);             dataFile.print(",");
+    dataFile.print(lon, 6);             dataFile.print(",");
+    dataFile.print(alt, 1);             dataFile.print(",");
+    dataFile.print(satellites);         dataFile.print(",");
+    dataFile.print(hdop, 2);            dataFile.print(",");
+    dataFile.print(speedObd, 1);        dataFile.print(",");
+    dataFile.print(lonAcc, 3);          dataFile.print(",");
+    dataFile.print(latAcc, 3);          dataFile.print(",");
+    dataFile.print(roll, 1);            dataFile.print(",");
+    dataFile.print(pitch, 1);           dataFile.print(",");
+    dataFile.print(slope, 1);           dataFile.print(",");
+    dataFile.print(slopeConfidence, 2); dataFile.print(",");
+    dataFile.print(rpm);                dataFile.print(",");
+    dataFile.print(load);               dataFile.print(",");
     dataFile.println(throttle, 1);
 
     rowCount++;

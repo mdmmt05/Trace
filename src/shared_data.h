@@ -26,6 +26,8 @@ struct VehicleData {
     volatile float roll     = 0.0f;   // °  — rollio   (lato destro in basso +)
     volatile float pitch    = 0.0f;   // °  — beccheggio (muso in alto +)
     volatile float slope    = 0.0f;   // °  — pendenza longitudinale stimata
+    volatile float slopeConfidence = 0.0f; // 0...1
+    volatile bool quasiStatic = false;
 };
 
 extern VehicleData vehicleData;

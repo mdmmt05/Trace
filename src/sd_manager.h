@@ -19,7 +19,7 @@ void sdWriteRow(
     float lonAcc, float latAcc, // G (IMU)
     float roll,   float pitch,  // ° (IMU)
     float slope,                // ° pendenza stimata (IMU)
-    uint8_t slopeReliable,      // 1 = velocità stabile → slope affidabile, 0 = distorta
+    float slopeConfidence,      // 0...1 sostituisce slopeReliable
     int rpm,
     int load,                   // %
     float throttle              // %
