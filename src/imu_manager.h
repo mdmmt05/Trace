@@ -71,6 +71,18 @@ struct ImuData {
 };
 
 // ---------------------------------------------------------------------------
+// Informazioni diagnostiche sulla calibrazione
+// ---------------------------------------------------------------------------
+struct ImuCalibrationInfo {
+    bool hasValidCalibration;   // true se NVS contiene dati validi
+    bool usingDefaults;         // true se si stanno usando i default (NVS assente/invalida)
+    float gyroBiasX, gyroBiasY, gyroBiasZ;   // LSB
+    float accBiasX, accBiasY, accBiasZ;       // LSB
+    float accScaleX, accScaleY, accScaleZ;    // fattore di scala
+    float mountingRoll, mountingPitch;        // gradi
+};
+
+// ---------------------------------------------------------------------------
 // API pubblica
 // ---------------------------------------------------------------------------
 
@@ -87,3 +99,24 @@ ImuData imuGetData();
 
 // Restituisce true se il sensore è stato inizializzato con successo.
 bool imuIsReady();
+
+// ---------------------------------------------------------------------------
+// API di calibrazione e commissioning
+// ---------------------------------------------------------------------------
+bool imuLoadCalibration();          // carica da NVS (chiamato da imuInit)
+bool imuSaveCalibration();          // salva parametri correnti in NVS
+bool imuHasValidCalibration();      // true se NVS contiene dati validi
+void imuResetCalibration();         // resetta a default e salva in NVS
+
+// Calibrazione giroscopio (veicolo fermo, acquisizione statica)
+bool imuRunGyroCalibration(unsigned int samples = 500);
+
+// Calibrazione accelerometro (veicolo fermo e in piano - assume roll=0, pitch=0)
+bool imuRunAccelCalibration(unsigned int samples = 500);
+
+// Imposta offset di montaggio (gradi) - sensore -> veicolo
+// Applica una rotazione fissa all'orientamento stimato
+void imuSetMountingAlignment(float roll_deg, float pitch_deg);
+
+// Ottiene informazioni diagnostiche sulla calibrazione corrente
+ImuCalibrationInfo imuGetCalibrationInfo();

@@ -54,6 +54,84 @@ static void buildFilename(char* buf, size_t bufSize) {
 }
 
 // ---------------------------------------------------------------------------
+// Gestione comandi seriali per calibrazione IMU (commissioning)
+// ---------------------------------------------------------------------------
+static void handleSerialCommands() {
+  static String input = "";
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n') {
+      input.trim();
+      if (input.length() > 0) {
+        if (input == "cal_gyro") {
+          Serial.println("Esecuzione calibrazione giroscopio (veicolo fermo)...");
+          if (imuRunGyroCalibration()) {
+            imuSaveCalibration();
+            Serial.println("Calibrazione giroscopio completata e salvata.");
+          } else {
+            Serial.println("Errore calibrazione giroscopio.");
+          }
+        }
+        else if (input == "cal_acc") {
+          Serial.println("Esecuzione calibrazione accelerometro (veicolo fermo e in piano)...");
+          if (imuRunAccelCalibration()) {
+            imuSaveCalibration();
+            Serial.println("Calibrazione accelerometro completata e salvata.");
+          } else {
+            Serial.println("Errore calibrazione accelerometro.");
+          }
+        }
+        else if (input.startsWith("set_mounting")) {
+          float roll, pitch;
+          if (sscanf(input.c_str(), "set_mounting %f %f", &roll, &pitch) == 2) {
+            imuSetMountingAlignment(roll, pitch);
+            imuSaveCalibration();
+            Serial.printf("Mounting impostato: roll=%.2f, pitch=%.2f\n", roll, pitch);
+          } else {
+            Serial.println("Uso: set_mounting <roll_deg> <pitch_deg>");
+          }
+        }
+        else if (input == "save_cal") {
+          if (imuSaveCalibration()) Serial.println("Calibrazione salvata in NVS.");
+          else Serial.println("Errore salvataggio.");
+        }
+        else if (input == "reset_cal") {
+          imuResetCalibration();
+          Serial.println("Calibrazione resettata a default.");
+        }
+        else if (input == "show_cal") {
+          ImuCalibrationInfo info = imuGetCalibrationInfo();
+          Serial.println("--- Calibrazione IMU ---");
+          Serial.printf("Valida in NVS: %s\n", info.hasValidCalibration ? "si" : "no");
+          Serial.printf("Usa default: %s\n", info.usingDefaults ? "si" : "no");
+          Serial.printf("Gyro bias (LSB): %.1f, %.1f, %.1f\n", info.gyroBiasX, info.gyroBiasY, info.gyroBiasZ);
+          Serial.printf("Acc bias (LSB): %.1f, %.1f, %.1f\n", info.accBiasX, info.accBiasY, info.accBiasZ);
+          Serial.printf("Acc scale: %.4f, %.4f, %.4f\n", info.accScaleX, info.accScaleY, info.accScaleZ);
+          Serial.printf("Mounting (deg): roll=%.2f, pitch=%.2f\n", info.mountingRoll, info.mountingPitch);
+        }
+        else if (input == "help") {
+          Serial.println("Comandi disponibili:");
+          Serial.println("  cal_gyro         - calibra giroscopio (veicolo fermo)");
+          Serial.println("  cal_acc          - calibra accelerometro (veicolo fermo e in piano)");
+          Serial.println("  set_mounting R P - imposta offset mounting (gradi)");
+          Serial.println("  save_cal         - salva parametri correnti in NVS");
+          Serial.println("  reset_cal        - resetta a default e salva");
+          Serial.println("  show_cal         - mostra parametri attuali");
+          Serial.println("  help             - questo messaggio");
+        }
+        else {
+          Serial.println("Comando sconosciuto. Digitare 'help'.");
+        }
+      }
+      input = "";
+    } else if (c != '\r') {
+      input += c;
+      if (input.length() > 64) input = "";
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 void setup() {
   // Serial0 — condivisa con obd2_manager in modalità UART sim.
   // IMPORTANTE: while(!Serial) senza timeout blocca il boot se l'USB non è
@@ -92,6 +170,7 @@ void setup() {
   webServerInit();
 
   // Serial.println("[SYS] In attesa del fix GNSS...");
+  Serial.println("[SYS] Pronto. Comandi seriali disponibili (help).");
 }
 
 // ---------------------------------------------------------------------------
@@ -99,7 +178,8 @@ void loop() {
   gnssUpdate();
   obd2Update();
   webServerHandle();
-  imuUpdate(); // lettura FIFO + filtro
+  imuUpdate();
+  handleSerialCommands();
 
   // ── ATTESA FIX ────────────────────────────────────────────────────────────
   if (sysState == SYS_WAITING_FIX) {

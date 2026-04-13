@@ -18,6 +18,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+#include <Preferences.h>
 
 // ---------------------------------------------------------------------------
 // Registri ISM330DHCX
@@ -99,16 +100,45 @@
 #define SLOPE_TC_QUASI_STATIC  2.0f      // aggiornamento rapido in quasi-statico
 #define SLOPE_TC_DYNAMIC       10.0f     // aggiornamento molto lento in dinamica
 
+// Runtime gyro refinement (opzionale)
+#define GYRO_REFINE_ENABLED    1
+#define GYRO_REFINE_MIN_SAMPLES 500   // campioni quasi-statici consecutivi
+#define GYRO_REFINE_RATE_MS    1000   // ogni secondo
+#define GYRO_REFINE_ALPHA      0.01f  // IIR lento
+#define GYRO_REFINE_MAX_CORR   0.5f   // max correzione accumulata (deg/s)
+
+// ---------------------------------------------------------------------------
+// Dati di calibrazione (persistenti in NVS)
+// ---------------------------------------------------------------------------
+struct CalibrationData {
+    uint32_t version = 1;
+    uint16_t checksum = 0;
+    float gyroBias[3] = {0};      // LSB
+    float accBias[3] = {0};       // LSB
+    float accScale[3] = {1,1,1};  // fattore di scala
+    float mountingRoll = 0;       // gradi
+    float mountingPitch = 0;      // gradi
+    bool valid = false;
+};
+
+static CalibrationData calData;
+static Preferences nvs;
+
 // ---------------------------------------------------------------------------
 // Stato interno — tutto privato al modulo
 // ---------------------------------------------------------------------------
  
 // Quaternione di orientamento Madgwick (normalizzato, w=1 = identità)
 static float q0 = 1.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
- 
-static float gyroBiasX = 0.0f, gyroBiasY = 0.0f, gyroBiasZ = 0.0f;
-static float accBiasX = 0.0f, accBiasY = 0.0f, accBiasZ = 0.0f;
-static float accScaleX = 1.0f, accScaleY = 1.0f, accScaleZ = 1.0f;
+// Quaternione di rotazione per mounting (sensore → veicolo)
+static float qm0 = 1.0f, qm1 = 0.0f, qm2 = 0.0f, qm3 = 0.0f;
+// Quaternione orientamento veicolo (calcolato = qm * q_sensore)
+static float qv0, qv1, qv2, qv3;
+
+// Runtime gyro bias refinement (non salvato)
+static float gyroBiasRuntime[3] = {0};
+static unsigned long refineLastTime = 0;
+static unsigned int refineQuasiStaticCount = 0;
 
 static bool ready = false;
 static ImuData imuData;   // dati più recenti
@@ -121,6 +151,92 @@ static unsigned long lastSlopeUpdate = 0;
 static uint8_t fifoBuffer[FIFO_BURST_SIZE];
 static float odrHz = 208.0f;        // ODR effettivo (Hz)
 static float sampleDt = 1.0f / odrHz;  // dt nominale tra campioni FIFO
+
+// ---------------------------------------------------------------------------
+// Helper checksum (semplice XOR a 16 bit)
+// ---------------------------------------------------------------------------
+static uint16_t computeChecksum(const CalibrationData& data) {
+    const uint8_t* ptr = (const uint8_t*)&data;
+    uint16_t sum = 0;
+    for (size_t i = 0; i < sizeof(CalibrationData) - sizeof(data.checksum); i++) {
+        sum ^= ptr[i];
+    }
+    return sum;
+}
+
+static bool validateChecksum(const CalibrationData& data) {
+    uint16_t stored = data.checksum;
+    CalibrationData tmp = data;
+    tmp.checksum = 0;
+    return (stored == computeChecksum(tmp));
+}
+
+static void updateChecksum(CalibrationData& data) {
+    data.checksum = 0;
+    data.checksum = computeChecksum(data);
+}
+
+// ---------------------------------------------------------------------------
+// Salvataggio / caricamento NVS
+// ---------------------------------------------------------------------------
+static bool saveToNVS() {
+    nvs.begin("imu_calib", false);
+    updateChecksum(calData);
+    size_t size = sizeof(CalibrationData);
+    bool ok = nvs.putBytes("calib", &calData, size) == size;
+    nvs.end();
+    return ok;
+}
+
+static bool loadFromNVS() {
+    nvs.begin("imu_calib", true);
+    size_t size = sizeof(CalibrationData);
+    CalibrationData tmp;
+    if (nvs.getBytes("calib", &tmp, size) != size) {
+        nvs.end();
+        return false;
+    }
+    nvs.end();
+    if (tmp.version == calData.version && validateChecksum(tmp)) {
+        calData = tmp;
+        calData.valid = true;
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Imposta quaternione di mounting da roll/pitch (yaw=0)
+// Ordine: prima pitch (Y), poi roll (X)
+// ---------------------------------------------------------------------------
+static void updateMountingQuaternion() {
+    float rollRad = calData.mountingRoll * M_PI / 180.0f;
+    float pitchRad = calData.mountingPitch * M_PI / 180.0f;
+    float cy = cosf(pitchRad * 0.5f);
+    float sy = sinf(pitchRad * 0.5f);
+    float cr = cosf(rollRad * 0.5f);
+    float sr = sinf(rollRad * 0.5f);
+    // Quaternione per rotazione ZYX? In realtà roll intorno X, pitch intorno Y.
+    // q = q_roll * q_pitch (prima pitch poi roll)
+    qm0 = cr * cy;
+    qm1 = sr * cy;
+    qm2 = cr * sy;
+    qm3 = sr * sy;
+    // Normalizza (dovrebbe già essere unitario)
+    float norm = sqrtf(qm0*qm0 + qm1*qm1 + qm2*qm2 + qm3*qm3);
+    if (norm > 0) {
+        qm0 /= norm; qm1 /= norm; qm2 /= norm; qm3 /= norm;
+    }
+}
+
+// Applica rotazione mounting al quaternione sensore -> veicolo
+static void applyMountingToQuaternion() {
+    // q_vehicle = q_mount * q_sensor
+    qv0 = qm0*q0 - qm1*q1 - qm2*q2 - qm3*q3;
+    qv1 = qm0*q1 + qm1*q0 + qm2*q3 - qm3*q2;
+    qv2 = qm0*q2 - qm1*q3 + qm2*q0 + qm3*q1;
+    qv3 = qm0*q3 + qm1*q2 - qm2*q1 + qm3*q0;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers I2C
@@ -152,91 +268,64 @@ static bool readRegs(uint8_t reg, uint8_t* buf, size_t len) {
 }
 
 // ---------------------------------------------------------------------------
-// Calibrazione statica (avvio)
+// Inizializzazione hardware ISM330DHCX
 // ---------------------------------------------------------------------------
-static void calibrateSensors(){
-    const int samples = 500;
-    double sumGx = 0, sumGy = 0, sumGz = 0;
-    double sumAx = 0, sumAy = 0, sumAz = 0;
-
-    Serial.print("[IMU] Calibrazione statica (gyro + acc bias)...");
-    for (int i = 0; i < samples; i++) {
-        // Legge raw (senza offset) – registri OUTX_L_G e OUTX_L_A
-        uint8_t buf[12];
-        if (!readRegs(ISM330_OUTX_L_G, buf, 12)) {
-            i--;
-            delay(2);
-            continue;
-        }
-        int16_t rawGx = (int16_t)((buf[1] << 8) | buf[0]);
-        int16_t rawGy = (int16_t)((buf[3] << 8) | buf[2]);
-        int16_t rawGz = (int16_t)((buf[5] << 8) | buf[4]);
-        int16_t rawAx = (int16_t)((buf[7] << 8) | buf[6]);
-        int16_t rawAy = (int16_t)((buf[9] << 8) | buf[8]);
-        int16_t rawAz = (int16_t)((buf[11] << 8) | buf[10]);
-
-        sumGx += rawGx; sumGy += rawGy; sumGz += rawGz;
-        sumAx += rawAx; sumAy += rawAy; sumAz += rawAz;
-
-        delay(2);
-        if (i % 50 == 0) Serial.print(".");
+static bool initISM330() {
+    // Reset del chip
+    writeReg(ISM330_CTRL3_C, 0x01);   // SW_RESET
+    delay(50);
+    // Verifica WHO_AM_I
+    if (readReg(ISM330_WHO_AM_I) != ISM330_WHO_AM_I_VAL) {
+        Serial.printf("[IMU] WHO_AM_I errato – atteso 0x%02X\n", ISM330_WHO_AM_I_VAL);
+        return false;
     }
-    Serial.println(" OK");
 
-    // Offset giroscopio (LSB)
-    gyroBiasX = (float)(sumGx / samples);
-    gyroBiasY = (float)(sumGy / samples);
-    gyroBiasZ = (float)(sumGz / samples);
+    // Configura blocchi: acc e gyro abilitati, modalità continua
+    writeReg(ISM330_CTRL1_XL, ACC_CONFIG);
+    writeReg(ISM330_CTRL2_G,  GYR_CONFIG);
+    writeReg(ISM330_CTRL3_C, 0x44);   // IF_INC = 1, BDU = 1, auto-increment, big-endian disabilitato
+    writeReg(ISM330_CTRL4_C, 0x08);   // FIFO enable
+    writeReg(ISM330_CTRL6_C, 0x00);   // gyro LPF2 disabilitato
+    writeReg(ISM330_CTRL7_G, 0x00);   // gyro HPF disabilitato
+    writeReg(ISM330_CTRL8_XL, 0x00);
+    writeReg(ISM330_CTRL9_XL, 0x38);  // acc X,Y,Z abilitati
+    writeReg(ISM330_CTRL10_C, 0x38);  // gyro X,Y,Z abilitati
 
-    // Offset accelerometro (LSB) - presuppone sensore fermo e montaggio orizzontale
-    // La gravità attesa è +-1G sull'asse Z (convenzione sensore: Z+ verso l'alto)
-    //Quindi bias = media - valore atteso (0 su X/Y, +-1G su Z)
-    float expectedAx = 0.0f, expectedAy = 0.0f, expectedAz = ACC_SCALE_4G;
-    accBiasX = (float)(sumAx / samples) - expectedAx;
-    accBiasY = (float)(sumAy / samples) - expectedAy;
-    accBiasZ = (float)(sumAz / samples) - expectedAz;
+    // Configura FIFO: modalità continua, watermark a FIFO_WATERMARK
+    writeReg(ISM330_FIFO_CTRL1, (uint8_t)(FIFO_WATERMARK & 0xFF));
+    writeReg(ISM330_FIFO_CTRL2, 0x06);   // FIFO continua (mode 6), watermark interrupt abilitato
+    writeReg(ISM330_FIFO_CTRL3, 0x00);
+    writeReg(ISM330_FIFO_CTRL4, 0x00);   // modalità FIFO (non Bypass)
 
-    // Scale factor dell'accelerometro: correzione grossolana basata sul modulo
-    // (opzionale - migliora la precisione statica)
-    float rawMag = sqrtf( (sumAx/samples)*(sumAx/samples) +
-                          (sumAy/samples)*(sumAy/samples) +
-                          (sumAz/samples)*(sumAz/samples) );
-    float expectedMag = ACC_SCALE_4G;   // 1G espresso in LSB
-    float scaleCorrection = expectedMag / rawMag;
-    accScaleX = scaleCorrection;
-    accScaleY = scaleCorrection;
-    accScaleZ = scaleCorrection;
-
-    Serial.printf("[IMU] Gyro bias: %.1f, %.1f, %.1f LSB\n", gyroBiasX, gyroBiasY, gyroBiasZ);
-    Serial.printf("[IMU] Acc bias: %.1f, %.1f, %.1f LSB  scale: %.3f\n", accBiasX, accBiasY, accBiasZ, scaleCorrection);
+    delay(50);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
-// Applica calibrazione ai raw LSB, restituisce valori fisici
+// Applica calibrazione intrinseca (bias, scale) e runtime gyro correction
 // ---------------------------------------------------------------------------
 static void applyCalibration(int16_t rawAx, int16_t rawAy, int16_t rawAz,
                              int16_t rawGx, int16_t rawGy, int16_t rawGz,
                              float& ax, float& ay, float& az,
                              float& gx, float& gy, float& gz) {
-    // Accelerometro: sottrai bias, scala, converti in G
-    ax = ((float)rawAx - accBiasX) * accScaleX / ACC_SCALE_4G;
-    ay = ((float)rawAy - accBiasY) * accScaleY / ACC_SCALE_4G;
-    az = ((float)rawAz - accBiasZ) * accScaleZ / ACC_SCALE_4G;
+    // Accelerometro
+    ax = ((float)rawAx - calData.accBias[0]) * calData.accScale[0] / ACC_SCALE_4G;
+    ay = ((float)rawAy - calData.accBias[1]) * calData.accScale[1] / ACC_SCALE_4G;
+    az = ((float)rawAz - calData.accBias[2]) * calData.accScale[2] / ACC_SCALE_4G;
 
-    // Giroscopio: sottrai bias, converti in °/s
-    gx = ((float)rawGx - gyroBiasX) / GYR_SCALE_500DPS;
-    gy = ((float)rawGy - gyroBiasY) / GYR_SCALE_500DPS;
-    gz = ((float)rawGz - gyroBiasZ) / GYR_SCALE_500DPS;
+    // Giroscopio: bias statico + runtime
+    gx = ((float)rawGx - calData.gyroBias[0] - gyroBiasRuntime[0]) / GYR_SCALE_500DPS;
+    gy = ((float)rawGy - calData.gyroBias[1] - gyroBiasRuntime[1]) / GYR_SCALE_500DPS;
+    gz = ((float)rawGz - calData.gyroBias[2] - gyroBiasRuntime[2]) / GYR_SCALE_500DPS;
 }
 
 // ---------------------------------------------------------------------------
-// Lettura batch dalla FIFO
+// Lettura batch FIFO
 // ---------------------------------------------------------------------------
-static int readFifoBatch(uint8_t* buffer,  size_t maxLen) {
+static int readFifoBatch(uint8_t* buffer, size_t maxLen) {
     uint16_t level = 0;
     uint8_t status = readReg(ISM330_STATUS_REG);
-    if (status & 0x01) {  // FIFO threshold reached
-        // Legge livello FIFO (16 bit)
+    if (status & 0x01) {
         uint8_t low = readReg(ISM330_FIFO_STATUS1);
         uint8_t high = readReg(ISM330_FIFO_STATUS2) & 0x07;
         level = (high << 8) | low;
@@ -245,7 +334,6 @@ static int readFifoBatch(uint8_t* buffer,  size_t maxLen) {
     if (level > FIFO_WATERMARK) level = FIFO_WATERMARK;
     size_t bytesToRead = level * BYTES_PER_SAMPLE;
     if (bytesToRead > maxLen) bytesToRead = maxLen;
-
     if (!readRegs(ISM330_FIFO_DATA_OUT_L, buffer, bytesToRead)) return 0;
     return bytesToRead;
 }
@@ -331,14 +419,13 @@ static void madgwickUpdateAdaptive(float ax, float ay, float az,
     q0 *= recipNorm; q1 *= recipNorm; q2 *= recipNorm; q3 *= recipNorm;
 }
 
-
 // ---------------------------------------------------------------------------
 // Conversione quaternione → angoli di Eulero (roll, pitch)
 //
 // Convenzione ZYX (yaw-pitch-roll), standard aeronautico / automotive.
 // Restituisce gradi.
 // ---------------------------------------------------------------------------
-static void quatToRollPitch(float& roll, float& pitch) {
+static void quatToRollPitch(float q0, float q1, float q2, float q3, float& roll, float& pitch) {
     // Roll (rotazione attorno X): atan2(2*(q0*q1 + q2*q3), 1 - 2*(q1²+q2²))
     roll  = atan2f(2.0f * (q0 * q1 + q2 * q3),
                    1.0f - 2.0f * (q1 * q1 + q2 * q2)) * (180.0f / M_PI);
@@ -359,6 +446,7 @@ static void quatToRollPitch(float& roll, float& pitch) {
 // dinamica (quella causata dal moto del veicolo).
 // ---------------------------------------------------------------------------
 static void removeGravity(float ax, float ay, float az,
+                          float q0, float q1, float q2, float q3,
                           float& lonAcc, float& latAcc) {
     // Ruota il vettore accelerazione dal frame sensore al frame mondo
     // usando la matrice di rotazione derivata dal quaternione.
@@ -407,37 +495,33 @@ static void updateSlopeEstimator(float currentPitch, bool quasiStatic, float dt)
 }
 
 // ---------------------------------------------------------------------------
-// Inizializzazione hardware ISM330DHCX
+// Runtime gyro bias refinement (opzionale, chiamato in imuUpdate)
 // ---------------------------------------------------------------------------
-static bool initISM330() {
-    // Reset del chip
-    writeReg(ISM330_CTRL3_C, 0x01);   // SW_RESET
-    delay(50);
-    // Verifica WHO_AM_I
-    if (readReg(ISM330_WHO_AM_I) != ISM330_WHO_AM_I_VAL) {
-        Serial.printf("[IMU] WHO_AM_I errato – atteso 0x%02X\n", ISM330_WHO_AM_I_VAL);
-        return false;
-    }
-
-    // Configura blocchi: acc e gyro abilitati, modalità continua
-    writeReg(ISM330_CTRL1_XL, ACC_CONFIG);
-    writeReg(ISM330_CTRL2_G,  GYR_CONFIG);
-    writeReg(ISM330_CTRL3_C, 0x44);   // IF_INC = 1, BDU = 1, auto-increment, big-endian disabilitato
-    writeReg(ISM330_CTRL4_C, 0x08);   // FIFO enable
-    writeReg(ISM330_CTRL6_C, 0x00);   // gyro LPF2 disabilitato
-    writeReg(ISM330_CTRL7_G, 0x00);   // gyro HPF disabilitato
-    writeReg(ISM330_CTRL8_XL, 0x00);
-    writeReg(ISM330_CTRL9_XL, 0x38);  // acc X,Y,Z abilitati
-    writeReg(ISM330_CTRL10_C, 0x38);  // gyro X,Y,Z abilitati
-
-    // Configura FIFO: modalità continua, watermark a FIFO_WATERMARK
-    writeReg(ISM330_FIFO_CTRL1, (uint8_t)(FIFO_WATERMARK & 0xFF));
-    writeReg(ISM330_FIFO_CTRL2, 0x06);   // FIFO continua (mode 6), watermark interrupt abilitato
-    writeReg(ISM330_FIFO_CTRL3, 0x00);
-    writeReg(ISM330_FIFO_CTRL4, 0x00);   // modalità FIFO (non Bypass)
-
-    delay(50);
-    return true;
+static void updateGyroRuntimeRefinement(bool quasiStatic, float gx, float gy, float gz) {
+    #if GYRO_REFINE_ENABLED
+        unsigned long now = millis();
+        if (quasiStatic) {
+            refineQuasiStaticCount++;
+            if (refineQuasiStaticCount >= GYRO_REFINE_MIN_SAMPLES &&
+                (now - refineLastTime) >= GYRO_REFINE_RATE_MS) {
+                refineLastTime = now;
+                // Correzione lenta: media dei valori correnti (già con bias statico rimosso)
+                // Vogliamo che il gyro tenda a zero in condizioni quasi-statiche.
+                // gx, gy, gz sono già in deg/s.
+                gyroBiasRuntime[0] = gyroBiasRuntime[0] * (1.0f - GYRO_REFINE_ALPHA) + gx * GYRO_REFINE_ALPHA;
+                gyroBiasRuntime[1] = gyroBiasRuntime[1] * (1.0f - GYRO_REFINE_ALPHA) + gy * GYRO_REFINE_ALPHA;
+                gyroBiasRuntime[2] = gyroBiasRuntime[2] * (1.0f - GYRO_REFINE_ALPHA) + gz * GYRO_REFINE_ALPHA;
+                // Limita correzione massima
+                for (int i=0; i<3; i++) {
+                    gyroBiasRuntime[i] = constrain(gyroBiasRuntime[i], -GYRO_REFINE_MAX_CORR, GYRO_REFINE_MAX_CORR);
+                }
+            }
+        } else {
+            refineQuasiStaticCount = 0;
+        }
+    #else
+        (void)quasiStatic; (void)gx; (void)gy; (void)gz;
+    #endif
 }
 
 // ===========================================================================
@@ -452,13 +536,25 @@ bool imuInit() {
         return false;
     }
 
-    // Calibrazione statica (sensore fermo!)
-    calibrateSensors();
+    // Carica calibrazione da NVS (se presente)
+    if (!loadFromNVS()) {
+        Serial.println("[IMU] Nessuna calibrazione valida in NVS, uso default.");
+        calData.valid = false;
+        // Default: bias zero, scale 1, mounting zero
+        memset(calData.gyroBias, 0, sizeof(calData.gyroBias));
+        memset(calData.accBias, 0, sizeof(calData.accBias));
+        for (int i=0; i<3; i++) calData.accScale[i] = 1.0f;
+        calData.mountingRoll = 0;
+        calData.mountingPitch = 0;
+    }
+    updateMountingQuaternion();
 
     // Reset stato filtro
     q0 = 1.0f; q1 = 0.0f; q2 = 0.0f; q3 = 0.0f;
     slopeFiltered = 0.0f;
     lastSlopeUpdate = millis();
+    memset(gyroBiasRuntime, 0, sizeof(gyroBiasRuntime));
+    refineQuasiStaticCount = 0;
 
     ready = true;
     imuData.valid = true;
@@ -501,21 +597,27 @@ void imuUpdate() {
         // Aggiorna filtro Madgwick con dt nominale
         madgwickUpdateAdaptive(ax, ay, az, gx, gy, gz, sampleDt);
 
+        // Applica mounting rotation per ottenere q_vehicle
+        applyMountingToQuaternion();
+
         // Calcola roll/pitch
         float roll, pitch;
-        quatToRollPitch(roll, pitch);
+        quatToRollPitch(qv0, qv1, qv2, qv3, roll, pitch);
         imuData.roll = roll;
         imuData.pitch = pitch;
 
         // Rimuovi gravità → accelerazioni dinamiche
         float lonAcc, latAcc;
-        removeGravity(ax, ay, az, lonAcc, latAcc);
+        removeGravity(ax, ay, az, qv0, qv1, qv2, qv3, lonAcc, latAcc);
         imuData.lonAcc = lonAcc;
         imuData.latAcc = latAcc;
 
         // Rileva quasi-statico
         bool qs = detectQuasiStatic(ax, ay, az, gx, gy, gz);
         imuData.quasiStatic = qs;
+
+        // Runtime gyro refinement (opzionale)
+        updateGyroRuntimeRefinement(qs, gx, gy, gz);
 
         // Stima slope lenta (usa pitch corrente)
         unsigned long now = micros();
@@ -546,4 +648,120 @@ void imuUpdate() {
 
 ImuData imuGetData() {
     return imuData;   // copia per valore — thread-safe su ESP32 single-core loop
+}
+
+// ---------------------------------------------------------------------------
+// API di calibrazione
+// ---------------------------------------------------------------------------
+bool imuLoadCalibration() {
+    return loadFromNVS();
+}
+
+bool imuSaveCalibration() {
+    updateMountingQuaternion();  // ricalcola quaternione prima di salvare
+    return saveToNVS();
+}
+
+bool imuHasValidCalibration() {
+    return calData.valid;
+}
+
+void imuResetCalibration() {
+    memset(calData.gyroBias, 0, sizeof(calData.gyroBias));
+    memset(calData.accBias, 0, sizeof(calData.accBias));
+    for (int i=0; i<3; i++) calData.accScale[i] = 1.0f;
+    calData.mountingRoll = 0;
+    calData.mountingPitch = 0;
+    calData.valid = true; // dopo reset viene considerata valida (default)
+    saveToNVS();
+    Serial.println("[IMU] Calibrazione resettata a default e salvata in NVS.");
+}
+
+bool imuRunGyroCalibration(unsigned int samples) {
+    if (!ready) return false;
+    Serial.printf("[IMU] Calibrazione giroscopio: acquisizione %d campioni...\n", samples);
+    double sumX = 0, sumY = 0, sumZ = 0;
+    for (unsigned int i = 0; i < samples; i++) {
+        uint8_t buf[6];
+        if (!readRegs(ISM330_OUTX_L_G, buf, 6)) {
+            i--;
+            delay(2);
+            continue;
+        }
+        int16_t rx = (int16_t)((buf[1] << 8) | buf[0]);
+        int16_t ry = (int16_t)((buf[3] << 8) | buf[2]);
+        int16_t rz = (int16_t)((buf[5] << 8) | buf[4]);
+        sumX += rx; sumY += ry; sumZ += rz;
+        delay(2);
+        if (i % 100 == 0) Serial.print(".");
+    }
+    calData.gyroBias[0] = (float)(sumX / samples);
+    calData.gyroBias[1] = (float)(sumY / samples);
+    calData.gyroBias[2] = (float)(sumZ / samples);
+    Serial.printf("\n[IMU] Gyro bias: %.1f, %.1f, %.1f LSB\n",
+        calData.gyroBias[0], calData.gyroBias[1], calData.gyroBias[2]);
+    calData.valid = true;
+    return true;
+}
+
+bool imuRunAccelCalibration(unsigned int samples) {
+    if (!ready) return false;
+    Serial.printf("[IMU] Calibrazione accelerometro (veicolo fermo e in piano).\n");
+    Serial.printf("Acquisizione %d campioni...\n", samples);
+    double sumX = 0, sumY = 0, sumZ = 0;
+    for (unsigned int i = 0; i < samples; i++) {
+        uint8_t buf[6];
+        if (!readRegs(ISM330_OUTX_L_A, buf, 6)) {
+            i--;
+            delay(2);
+            continue;
+        }
+        int16_t rx = (int16_t)((buf[1] << 8) | buf[0]);
+        int16_t ry = (int16_t)((buf[3] << 8) | buf[2]);
+        int16_t rz = (int16_t)((buf[5] << 8) | buf[4]);
+        sumX += rx; sumY += ry; sumZ += rz;
+        delay(2);
+        if (i % 100 == 0) Serial.print(".");
+    }
+    float meanX = sumX / samples;
+    float meanY = sumY / samples;
+    float meanZ = sumZ / samples;
+    // Atteso: 0, 0, +ACC_SCALE_4G (Z su)
+    calData.accBias[0] = meanX - 0.0f;
+    calData.accBias[1] = meanY - 0.0f;
+    calData.accBias[2] = meanZ - ACC_SCALE_4G;
+    // Calcola scala basata sul modulo
+    float rawMag = sqrtf(meanX*meanX + meanY*meanY + meanZ*meanZ);
+    float scaleCorrection = ACC_SCALE_4G / rawMag;
+    for (int i=0; i<3; i++) calData.accScale[i] = scaleCorrection;
+    Serial.printf("\n[IMU] Acc bias: %.1f, %.1f, %.1f LSB  scale: %.3f\n",
+                  calData.accBias[0], calData.accBias[1], calData.accBias[2], scaleCorrection);
+    calData.valid = true;
+    return true;
+}
+
+void imuSetMountingAlignment(float roll_deg, float pitch_deg) {
+    calData.mountingRoll = roll_deg;
+    calData.mountingPitch = pitch_deg;
+    updateMountingQuaternion();
+    Serial.printf("[IMU] Mounting alignment impostato: roll=%.1f°, pitch=%.1f°\n",
+        roll_deg, pitch_deg);
+}
+
+ImuCalibrationInfo imuGetCalibrationInfo() {
+    ImuCalibrationInfo info;
+    info.hasValidCalibration = calData.valid;
+    info.usingDefaults = !calData.valid;  // se non valida, sta usando default
+    info.gyroBiasX = calData.gyroBias[0];
+    info.gyroBiasY = calData.gyroBias[1];
+    info.gyroBiasZ = calData.gyroBias[2];
+    info.accBiasX = calData.accBias[0];
+    info.accBiasY = calData.accBias[1];
+    info.accBiasZ = calData.accBias[2];
+    info.accScaleX = calData.accScale[0];
+    info.accScaleY = calData.accScale[1];
+    info.accScaleZ = calData.accScale[2];
+    info.mountingRoll = calData.mountingRoll;
+    info.mountingPitch = calData.mountingPitch;
+    return info;
 }
