@@ -22,7 +22,19 @@ void sdWriteRow(
     float slopeConfidence,      // 0...1 sostituisce slopeReliable
     int rpm,
     int load,                   // %
-    float throttle              // %
+    float throttle,             // %
+
+    // nuovi campi temporali
+    uint64_t monoUs,            // tempo monotono del log
+    int64_t utcUs,              // UTC stimata (microsecondi, 0 = invalida)
+    bool utcValid,
+    uint8_t syncQuality,
+    uint64_t imuTimestampUs,
+    uint64_t gnssTimestampUs,
+    uint64_t obdSpeedTimestampUs,
+    int imuAgeMs,
+    int gnssAgeMs,
+    int obdSpeedAgeMs
 );
 
 // Flush manuale (normalmente automatico ogni N righe)

@@ -15,6 +15,7 @@
 
 #include "imu_manager.h"
 #include "shared_data.h"
+#include "time_sync_manager.h"
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
@@ -572,6 +573,22 @@ void imuUpdate() {
     if (bytesRead < BYTES_PER_SAMPLE) return;  // nessun campione
 
     int samplesInBatch = bytesRead / BYTES_PER_SAMPLE;
+    if (samplesInBatch == 0) return;
+
+    // Acquisizione timestamp monotono di inizio lettura
+    uint64_t readStartUs = timeSyncNowUs();
+    uint32_t dtUs = (uint32_t)(sampleDt * 1e6f);   // sampleDt = 1/208 ≈ 0.0048077 s → 4808 us
+
+    // -----------------------------------------------------------------------
+    // Ricostruzione timestamp dei campioni nel batch
+    // Assumiamo che l'ultimo campione del batch sia stato acquisito
+    // approssimativamente all'istante readStartUs (inizio lettura).
+    // Il primo campione è più vecchio di (samplesInBatch-1)*dtUs.
+    // -----------------------------------------------------------------------
+    uint64_t firstSampleMonoUs = readStartUs - (samplesInBatch - 1) * dtUs;
+    uint64_t lastSampleMonoUs = readStartUs;   // approssimazione
+
+    // Elabora tutti i campioni del batch
     for (int i = 0; i < samplesInBatch; i++) {
         uint8_t* ptr = &fifoBuffer[i * BYTES_PER_SAMPLE];
         // Estrae raw (acc: 6 byte, gyro: 6 byte – little-endian)
@@ -637,6 +654,14 @@ void imuUpdate() {
         imuData.slopeConfidence = confidence;
     }
 
+    // Dopo aver processato tutto il batch, salva i metadati temporali
+    imuData.batchReadMonoUs = readStartUs;
+    imuData.batchSamples = samplesInBatch;
+    imuData.sampleDtUs = dtUs;
+    imuData.firstSampleMonoUs = firstSampleMonoUs;
+    // Il campione più recente (ultimo del batch) ha timestamp = readStartUs
+    imuData.lastSampleMonoUs = readStartUs;
+    
     // Copia anche nella struttura condivisa (per altri moduli)
     vehicleData.lonAcc = imuData.lonAcc;
     vehicleData.latAcc = imuData.latAcc;

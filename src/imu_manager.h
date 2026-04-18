@@ -1,5 +1,7 @@
 #pragma once
- 
+
+#include <stdint.h>
+
 // ---------------------------------------------------------------------------
 // imu_manager.h
 // Gestione ISM330DHCX (accelerometro + giroscopio 6-DOF) via I2C.
@@ -68,6 +70,13 @@ struct ImuData {
     float gyrX_cal = 0.0f, gyrY_cal = 0.0f, gyrZ_cal = 0.0f;
  
     bool  valid    = false;  // false finché il sensore non è inizializzato
+
+    // Timestamp monotoni associati ai dati IMU
+    uint64_t lastSampleMonoUs = 0;   // timestamp del campione più recente
+    uint64_t firstSampleMonoUs = 0;  // timestamp del campione più vecchio nel batch (opzionale)
+    uint64_t batchReadMonoUs = 0;    // timestamp di inizio lettura batch
+    uint16_t batchSamples = 0;       // numero di campioni nel batch
+    uint32_t sampleDtUs = 0;         // intervallo nominale tra campioni (microsecondi)
 };
 
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 #include "gnss_manager.h"
 #include "obd2_manager.h"
 #include "imu_manager.h"
+#include "time_sync_manager.h"
 
 // ---------------------------------------------------------------------------
 // Istanza globale condivisa (extern in shared_data.h)
@@ -108,6 +109,9 @@ static void handleSerialCommands() {
           Serial.printf("Acc bias (LSB): %.1f, %.1f, %.1f\n", info.accBiasX, info.accBiasY, info.accBiasZ);
           Serial.printf("Acc scale: %.4f, %.4f, %.4f\n", info.accScaleX, info.accScaleY, info.accScaleZ);
           Serial.printf("Mounting (deg): roll=%.2f, pitch=%.2f\n", info.mountingRoll, info.mountingPitch);
+          TimeSyncStatus ts = timeSyncGetStatus();
+          Serial.printf("Time sync: valid=%d quality=%d offset=%lld lastSync=%llu\n",
+                        ts.utcValid, ts.quality, ts.utcOffsetUs, ts.lastSyncMonoUs);
         }
         else if (input == "help") {
           Serial.println("Comandi disponibili:");
@@ -181,6 +185,17 @@ void loop() {
   imuUpdate();
   handleSerialCommands();
 
+  // Aggiorna la soft‑sync con l'ultimo fix GNSS valido (al massimo una volta al secondo)
+  static uint64_t lastGnssSyncUs = 0;
+  GnssData gnss = gnssGetData();
+  if (gnss.utcValid && gnss.fixRxMonoUs != 0) {
+    uint64_t nowUs = timeSyncNowUs();
+    if (nowUs - lastGnssSyncUs > 1000000ULL) {   // al massimo 1Hz
+      timeSyncUpdateFromGnss(&gnss, gnss.fixRxMonoUs);
+      lastGnssSyncUs = nowUs;
+    }
+  }
+
   // ── ATTESA FIX ────────────────────────────────────────────────────────────
   if (sysState == SYS_WAITING_FIX) {
     blinkWaitingFix();
@@ -211,20 +226,47 @@ void loop() {
   if (now - lastLog < LOG_INTERVAL_MS) return;
   lastLog = now;
 
-  char ts[20];
-  gnssFormatTimestamp(ts, sizeof(ts));
-  GnssData g = gnssGetData();
+  // Acquisizione snapshot temporale
+  uint64_t logMonoUs = timeSyncNowUs();
+  GnssData   g = gnssGetData();
   ImuData   imu = imuGetData();
+  VehicleData vd;   // copia locale dei dati condivisi (per coerenza)
+  noInterrupts();
+  vd = vehicleData;
+  interrupts();
 
-  sdWriteRow(ts,
+  // Calcolo età campioni
+  int imuAgeMs = (imu.lastSampleMonoUs != 0) ? (int)((logMonoUs - imu.lastSampleMonoUs) / 1000) : -1;
+  int gnssAgeMs = (g.fixRxMonoUs != 0) ? (int)((logMonoUs - g.fixRxMonoUs) / 1000) : -1;
+  int obdSpeedAgeMs = (vd.speedTimestampUs != 0) ? (int)((logMonoUs - vd.speedTimestampUs) / 1000) : -1;
+
+  // UTC stimata e qualità sync
+  int64_t utcUs = timeSyncMonoToUtcUs(logMonoUs);
+  TimeSyncStatus ts = timeSyncGetStatus();
+
+  // Timestamp stringa per compatibilità (opzionale, possiamo usare gnssFormatTimestamp)
+  char tsStr[20];
+  gnssFormatTimestamp(tsStr, sizeof(tsStr));
+
+  sdWriteRow(tsStr,
     g.lat, g.lon, g.altMeters,
     g.satellites, g.hdop,
-    vehicleData.speed,
+    vd.speed,
     imu.lonAcc,  imu.latAcc,
     imu.roll,    imu.pitch,
     imu.slope,   imu.slopeConfidence,
-    vehicleData.rpm,
-    vehicleData.load,
-    vehicleData.throttle
+    vd.rpm,
+    vd.load,
+    vd.throttle,
+    logMonoUs,
+    utcUs,
+    ts.utcValid,
+    ts.quality,
+    imu.lastSampleMonoUs,
+    g.fixRxMonoUs,
+    vd.speedTimestampUs,
+    imuAgeMs,
+    gnssAgeMs,
+    obdSpeedAgeMs
   );
 }

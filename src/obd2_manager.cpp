@@ -12,7 +12,7 @@
 #include "obd2_manager.h"
 #include "shared_data.h"
 #include <Arduino.h>
-#include "driver/twai.h"
+#include "time_sync_manager.h"
 
 // Il blocco TWAI include l'header solo se serve — a livello di file, non dentro funzioni
 #ifdef OBD2_TRANSPORT_TWAI
@@ -63,27 +63,37 @@ static void _decodeFrame (uint32_t id, const uint8_t* data, uint8_t dlc) {
     uint8_t A = (dlc > 3) ? data[3] : 0;
     uint8_t B = (dlc > 4) ? data[4] : 0;
 
+    uint64_t nowUs = timeSyncNowUs();   // timestamp di ricezione
+
     switch (pid) {
         case 0x0C:  // RPM = (A*256 + B) / 4  — identico al vecchio Arduino
           vehicleData.rpm = ((A * 256) + B) / 4;
+          vehicleData.rpmTimestampUs = nowUs;
           break;
     
         case 0x0D:  // Velocità = A  (km/h diretta)
           vehicleData.speed = (float)A;
+          vehicleData.speedTimestampUs = nowUs;
           break;
     
         case 0x04:  // Carico motore = A * 100 / 255
           vehicleData.load = (int)((A * 100) / 255);
+          vehicleData.loadTimestampUs = nowUs;
           break;
     
         case 0x11:  // Posizione farfalla = A * 100 / 255
           vehicleData.throttle = (float)((A * 100) / 255);
+          vehicleData.throttleTimestampUs = nowUs;
           break;
     
         case 0x05:  // Temperatura liquido raffreddamento = A - 40  (°C)
           vehicleData.coolant = (float)A - 40.0f;
+          vehicleData.coolantTimestampUs = nowUs;
           break;
     }
+
+    // Per ogni frame utile aggiorna anche il timestamp generale
+    vehicleData.lastObdFrameMonoUs = nowUs;
 }
 
 // ---------------------------------------------------------------------------

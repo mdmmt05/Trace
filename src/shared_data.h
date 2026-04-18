@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdint.h>
+
 // ---------------------------------------------------------------------------
 // shared_data.h
 // Struttura dati condivisa tra tutti i moduli.
@@ -19,6 +21,14 @@ struct VehicleData {
     volatile int   load     = 0;      // %
     volatile float throttle = 0.0f;   // %
     volatile float coolant  = 0.0f;   // °C
+
+    // Timestamp monotoni (microsecondi) associati a ogni dato OBD
+    volatile uint64_t lastObdFrameMonoUs = 0;
+    volatile uint64_t speedTimestampUs   = 0;
+    volatile uint64_t rpmTimestampUs     = 0;
+    volatile uint64_t loadTimestampUs    = 0;
+    volatile uint64_t throttleTimestampUs= 0;
+    volatile uint64_t coolantTimestampUs = 0;
  
     // IMU (imu_manager)
     volatile float lonAcc   = 0.0f;   // G  — accelerazione longitudinale (avanti+)
