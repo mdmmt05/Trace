@@ -38,6 +38,11 @@ struct VehicleData {
     volatile float slope    = 0.0f;   // °  — pendenza longitudinale stimata
     volatile float slopeConfidence = 0.0f; // 0...1
     volatile bool quasiStatic = false;
+
+    // Gear estimator
+    volatile int   gearEstimated = 0;
+    volatile bool  gearValid = false;
+    volatile uint64_t gearTimestampUs = 0;
 };
 
 extern VehicleData vehicleData;

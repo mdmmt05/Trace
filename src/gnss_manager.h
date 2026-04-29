@@ -22,6 +22,7 @@ struct GnssData {
     float lon = 0.0f;
     float altMeters = 0.0f;
     float speedKmh = 0.0f;
+    float course_deg = -1.0f; // Nome: course over ground (0-360), -1 = invalido
 
     uint8_t satellites = 0;
     float hdop = 99.9f;
