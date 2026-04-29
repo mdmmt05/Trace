@@ -20,10 +20,14 @@ void sdWriteRow(
     float roll,   float pitch,  // ° (IMU)
     float slope,                // ° pendenza stimata (IMU)
     float slopeConfidence,      // 0...1 sostituisce slopeReliable
+    // Nuovi campi fusione veicolo
+    float heading_deg,
+    float yawRate_dps,
+    float heading_confidence,
     int rpm,
     int load,                   // %
     float throttle,             // %
-
+    int estimated_gear,
     // nuovi campi temporali
     uint64_t monoUs,            // tempo monotono del log
     int64_t utcUs,              // UTC stimata (microsecondi, 0 = invalida)

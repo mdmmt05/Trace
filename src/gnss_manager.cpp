@@ -69,6 +69,7 @@ static void updateInternalSnapshot() {
         }
         if (gps.altitude.isValid())    s_lastValidData.altMeters  = (float)gps.altitude.meters();
         if (gps.speed.isValid())       s_lastValidData.speedKmh   = (float)gps.speed.kmph();
+        if (gps.course.isValid())      s_lastValidData.course_deg = (float)gps.course.deg();
         if (gps.satellites.isValid())  s_lastValidData.satellites = (uint8_t)gps.satellites.value();
         if (gps.hdop.isValid())        s_lastValidData.hdop       = (float)gps.hdop.hdop();
         if (gps.date.isValid()) {
@@ -100,6 +101,7 @@ static void updateInternalSnapshot() {
     }
     if (gps.altitude.isValid())    temp.altMeters  = (float)gps.altitude.meters();
     if (gps.speed.isValid())       temp.speedKmh   = (float)gps.speed.kmph();
+    if (gps.course.isValid())      temp.course_deg = (float)gps.course.deg();
     if (gps.satellites.isValid())  temp.satellites = (uint8_t)gps.satellites.value();
     if (gps.hdop.isValid())        temp.hdop       = (float)gps.hdop.hdop();
     if (gps.date.isValid()) {

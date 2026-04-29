@@ -35,7 +35,9 @@ bool sdOpenFile(const char* path) {
             "speed_obd_kmh,"
             "acc_lon_G,acc_lat_G,"
             "roll_deg,pitch_deg,slope_deg,slope_confidence,"
+            "heading_deg,yawRate_dps,heading_confidence,"   // <-- aggiunto
             "rpm,load_pct,throttle_pct,"
+            "estimated_gear," 
             "t_mono_us,utc_epoch_us,utc_valid,sync_quality,"
             "imu_t_us,gnss_t_us,obd_speed_t_us,"
             "imu_age_ms,gnss_age_ms,obd_speed_age_ms"
@@ -55,10 +57,11 @@ void sdWriteRow(
     float roll,   float pitch,
     float slope,
     float slopeConfidence,
+    float heading_deg, float yawRate_dps,  float heading_confidence,   // nuovi
     int rpm,
     int load,
     float throttle,
-
+    int estimated_gear,
     uint64_t monoUs,
     int64_t utcUs,
     bool utcValid,
@@ -85,9 +88,13 @@ void sdWriteRow(
     dataFile.print(pitch, 1);           dataFile.print(",");
     dataFile.print(slope, 1);           dataFile.print(",");
     dataFile.print(slopeConfidence, 2); dataFile.print(",");
+    dataFile.print(heading_deg, 1);        dataFile.print(",");
+    dataFile.print(yawRate_dps, 2);        dataFile.print(",");
+    dataFile.print(heading_confidence, 2); dataFile.print(",");
     dataFile.print(rpm);                dataFile.print(",");
     dataFile.print(load);               dataFile.print(",");
     dataFile.print(throttle, 1);        dataFile.print(",");
+    dataFile.print(estimated_gear); dataFile.print(",");
 
     // Nuovi campi temporali
     dataFile.print(monoUs);                 dataFile.print(",");

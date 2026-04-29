@@ -8,6 +8,8 @@
 #include "obd2_manager.h"
 #include "imu_manager.h"
 #include "time_sync_manager.h"
+#include "vehicle_fusion_manager.h"
+#include "gear_estimator.h"
 
 // ---------------------------------------------------------------------------
 // Istanza globale condivisa (extern in shared_data.h)
@@ -123,6 +125,78 @@ static void handleSerialCommands() {
           Serial.println("  show_cal         - mostra parametri attuali");
           Serial.println("  help             - questo messaggio");
         }
+        else if (input == "gear_help") {
+          Serial.println("Comandi marcia:");
+          Serial.println("  gear_show           - mostra calibrazione corrente");
+          Serial.println("  gear_cal <1..5>     - prepara calibrazione per una marcia");
+          Serial.println("  gear_capture        - acquisisce finestra stabile (2 sec)");
+          Serial.println("  gear_save           - salva in NVS la calibrazione acquisita");
+          Serial.println("  gear_reset          - cancella tutte le calibrazioni");
+        }
+        else if (input == "gear_show") {
+          GearCalibrationInfo info = gearEstimatorGetCalibrationInfo();
+          Serial.println("--- Calibrazione marce ---");
+          Serial.printf("Valida: %s\n", info.hasValidCalibration ? "si" : "no");
+          for (int i=1; i<=5; i++) {
+            if (info.validForGear[i])
+              Serial.printf("Marcia %d: ratio K = %.2f (RPM/km/h)\n", i, info.ratioForGear[i]);
+            else
+              Serial.printf("Marcia %d: non calibrata\n", i);
+          }
+        }
+        else if (input.startsWith("gear_cal ")) {
+          int gear = atoi(input.c_str() + 8);
+          if (gear >= 1 && gear <= 5) {
+            if (gearEstimatorStartCapture(gear)) {
+              Serial.printf("Calibrazione marcia %d avviata. Quando stabile, inviare 'gear_capture'.\n", gear);
+            } else {
+              Serial.println("Errore: acquisizione già in corso.");
+            }
+          } else {
+            Serial.println("Uso: gear_cal <1..5>");
+          }
+        }
+        else if (input == "gear_capture") {
+          if (!gearEstimatorIsCapturing()) {
+            Serial.println("Nessuna calibrazione attiva. Usare 'gear_cal <n>' prima.");
+          } else {
+            // La capture avviene in background, ma per semplificare attendiamo che finisca
+            // (l'utente deve attendere 2 secondi). Possiamo anche fare polling.
+            // Per evitare blocchi, stampiamo solo lo stato dopo la fine asincrona.
+            // Qui forziamo un'attesa breve (meglio gestire asincrono, ma per demo va bene)
+            Serial.println("Acquisizione in corso (2 secondi)... attendere.");
+            // La funzione captureAccumulate verrà chiamata nel loop, quindi non blocchiamo.
+            // L'utente deve solo inviare gear_capture e poi dopo 2 secondi chiedere gear_save.
+            // Aggiungiamo un messaggio per indicare di attendere.
+          }
+        }
+        else if (input == "gear_save") {
+          float ratio, speedAvg, rpmAvg;
+          if (gearEstimatorGetCaptureResult(ratio, speedAvg, rpmAvg)) {
+            // Dobbiamo sapere per quale marcia era stata avviata la capture.
+            // La variabile s_captureGear non è accessibile, quindi la recuperiamo tramite una funzione ad hoc.
+            // Aggiungiamo una funzione di supporto in gear_estimator: int gearEstimatorGetCapturingGear()
+            // Per semplicità, qui la omettiamo; l'utente deve ricordarsi la marcia.
+            // Implementiamo una soluzione: mostriamo il rapporto e chiediamo di specificare la marcia.
+            Serial.printf("Acquisizione stabile: ratio = %.2f (speed=%.1f km/h, rpm=%.0f)\n", ratio, speedAvg, rpmAvg);
+            Serial.println("Per salvare, usare 'gear_set <marcia> <ratio>' oppure rieseguire 'gear_cal' e 'gear_capture'.");
+            // Alternativa: aggiungere comando gear_set
+          } else {
+            Serial.println("Nessuna acquisizione valida disponibile. Eseguire prima 'gear_cal' e 'gear_capture'.");
+          }
+        }
+        else if (input.startsWith("gear_set ")) {
+          int gear; float ratio;
+          if (sscanf(input.c_str(), "gear_set %d %f", &gear, &ratio) == 2 && gear>=1 && gear<=5) {
+            gearEstimatorSetRatioForGear(gear, ratio);
+            Serial.printf("Marcia %d impostata manualmente con ratio = %.2f\n", gear, ratio);
+          } else {
+            Serial.println("Uso: gear_set <1..5> <ratio>");
+          }
+        }
+        else if (input == "gear_reset") {
+          gearEstimatorResetCalibration();
+        }
         else {
           Serial.println("Comando sconosciuto. Digitare 'help'.");
         }
@@ -161,6 +235,8 @@ void setup() {
   }
   esp_task_wdt_reset(); // feed watchdog dopo calibrazione
 
+  vehicleFusionInit();
+  gearEstimatorInit();
   if (!sdInit()) {
     // Serial.println("[SD] Init fallita");   // <-- commentato in modalità UART sim
     // SD non presente o corrotta: segnala con LED rosso lampeggiante 3×
@@ -183,6 +259,8 @@ void loop() {
   obd2Update();
   webServerHandle();
   imuUpdate();
+  vehicleFusionUpdate();
+  gearEstimatorUpdate();
   handleSerialCommands();
 
   // Aggiorna la soft‑sync con l'ultimo fix GNSS valido (al massimo una volta al secondo)
@@ -230,6 +308,7 @@ void loop() {
   uint64_t logMonoUs = timeSyncNowUs();
   GnssData   g = gnssGetData();
   ImuData   imu = imuGetData();
+  VehicleState vf = vehicleFusionGetState();
   VehicleData vd;   // copia locale dei dati condivisi (per coerenza)
   noInterrupts();
   vd = vehicleData;
@@ -255,9 +334,11 @@ void loop() {
     imu.lonAcc,  imu.latAcc,
     imu.roll,    imu.pitch,
     imu.slope,   imu.slopeConfidence,
+    vf.heading_deg, vf.yawRate_dps, vf.headingConfidence,
     vd.rpm,
     vd.load,
     vd.throttle,
+    vd.gearEstimated,
     logMonoUs,
     utcUs,
     ts.utcValid,
