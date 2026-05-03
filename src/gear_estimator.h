@@ -39,7 +39,9 @@ typedef struct {
     bool hasValidCalibration;
     bool usingDefaults;
     float ratioForGear[GEAR_MAX_GEARS + 1]; // 1..5
-    float validForGear[GEAR_MAX_GEARS + 1];
+    bool validForGear[GEAR_MAX_GEARS + 1];
+    float rpmRefForGear[GEAR_MAX_GEARS + 1];   // 1..5
+    float speedRefForGear[GEAR_MAX_GEARS + 1];
 } GearCalibrationInfo;
 
 // ---------------------------------------------------------------------------
@@ -63,6 +65,7 @@ bool gearEstimatorStartCapture(int gear);                                       
 bool gearEstimatorIsCapturing();                                                  // true se una finestra è attiva
 void gearEstimatorAbortCapture();                                                 // interrompe senza salvare
 bool gearEstimatorGetCaptureResult(float &ratio, float &speedAvg, float &rpmAvg); // true se acquisizione completata con successo
-void gearEstimatorSetRatioForGear(int gear, float ratio);                         // imposta in RAM (senza salvare)
+int  gearEstimatorGetCapturingGear();                                             // marcia per cui è stata avviata l'acquisizione
+bool gearEstimatorSaveCapturedGear();                                             // salva in NVS l'ultima acquisizione stabile (usa la marcia registrata)
 
 GearCalibrationInfo gearEstimatorGetCalibrationInfo();

@@ -59,153 +59,132 @@ static void buildFilename(char* buf, size_t bufSize) {
 // ---------------------------------------------------------------------------
 // Gestione comandi seriali per calibrazione IMU (commissioning)
 // ---------------------------------------------------------------------------
+
 static void handleSerialCommands() {
   static String input = "";
   while (Serial.available()) {
-    char c = Serial.read();
-    if (c == '\n') {
-      input.trim();
-      if (input.length() > 0) {
-        if (input == "cal_gyro") {
-          Serial.println("Esecuzione calibrazione giroscopio (veicolo fermo)...");
-          if (imuRunGyroCalibration()) {
-            imuSaveCalibration();
-            Serial.println("Calibrazione giroscopio completata e salvata.");
-          } else {
-            Serial.println("Errore calibrazione giroscopio.");
+      char c = Serial.read();
+      if (c == '\n') {
+          input.trim();
+          if (input.length() > 0) {
+              // --- Comandi IMU (già esistenti) ---
+              if (input == "cal_gyro") {
+                  Serial.println("Esecuzione calibrazione giroscopio (veicolo fermo)...");
+                  if (imuRunGyroCalibration()) {
+                      imuSaveCalibration();
+                      Serial.println("Calibrazione giroscopio completata e salvata.");
+                  } else {
+                      Serial.println("Errore calibrazione giroscopio.");
+                  }
+              }
+              else if (input == "cal_acc") {
+                  Serial.println("Esecuzione calibrazione accelerometro (veicolo fermo e in piano)...");
+                  if (imuRunAccelCalibration()) {
+                      imuSaveCalibration();
+                      Serial.println("Calibrazione accelerometro completata e salvata.");
+                  } else {
+                      Serial.println("Errore calibrazione accelerometro.");
+                  }
+              }
+              else if (input.startsWith("set_mounting")) {
+                  float roll, pitch;
+                  if (sscanf(input.c_str(), "set_mounting %f %f", &roll, &pitch) == 2) {
+                      imuSetMountingAlignment(roll, pitch);
+                      imuSaveCalibration();
+                      Serial.printf("Mounting impostato: roll=%.2f, pitch=%.2f\n", roll, pitch);
+                  } else {
+                      Serial.println("Uso: set_mounting <roll_deg> <pitch_deg>");
+                  }
+              }
+              else if (input == "save_cal") {
+                  if (imuSaveCalibration()) Serial.println("Calibrazione salvata in NVS.");
+                  else Serial.println("Errore salvataggio.");
+              }
+              else if (input == "reset_cal") {
+                  imuResetCalibration();
+                  Serial.println("Calibrazione resettata a default.");
+              }
+              else if (input == "show_cal") {
+                  ImuCalibrationInfo info = imuGetCalibrationInfo();
+                  Serial.println("--- Calibrazione IMU ---");
+                  Serial.printf("Valida in NVS: %s\n", info.hasValidCalibration ? "si" : "no");
+                  Serial.printf("Usa default: %s\n", info.usingDefaults ? "si" : "no");
+                  Serial.printf("Gyro bias (LSB): %.1f, %.1f, %.1f\n", info.gyroBiasX, info.gyroBiasY, info.gyroBiasZ);
+                  Serial.printf("Acc bias (LSB): %.1f, %.1f, %.1f\n", info.accBiasX, info.accBiasY, info.accBiasZ);
+                  Serial.printf("Acc scale: %.4f, %.4f, %.4f\n", info.accScaleX, info.accScaleY, info.accScaleZ);
+                  Serial.printf("Mounting (deg): roll=%.2f, pitch=%.2f\n", info.mountingRoll, info.mountingPitch);
+                  TimeSyncStatus ts = timeSyncGetStatus();
+                  Serial.printf("Time sync: valid=%d quality=%d offset=%lld lastSync=%llu\n",
+                                ts.utcValid, ts.quality, ts.utcOffsetUs, ts.lastSyncMonoUs);
+              }
+              // --- Comandi marcia (modificati) ---
+              else if (input == "gear_help") {
+                  Serial.println("Comandi marcia:");
+                  Serial.println("  gear_show           - mostra calibrazione corrente");
+                  Serial.println("  gear_cal <1..5>     - avvia calibrazione per una marcia (acquisizione 2 secondi)");
+                  Serial.println("  gear_save           - salva in NVS l'ultima acquisizione completata");
+                  Serial.println("  gear_reset          - cancella tutte le calibrazioni");
+              }
+              else if (input == "gear_show") {
+                  GearCalibrationInfo info = gearEstimatorGetCalibrationInfo();
+                  Serial.println("--- Calibrazione marce ---");
+                  Serial.printf("Valida: %s\n", info.hasValidCalibration ? "si" : "no");
+                  for (int i = 1; i <= 5; i++) {
+                      if (info.validForGear[i]) {
+                          Serial.printf("Marcia %d: ratio=%.2f, speed_ref=%.1f km/h, rpm_ref=%.0f\n",
+                                        i,
+                                        info.ratioForGear[i],
+                                        info.speedRefForGear[i],
+                                        info.rpmRefForGear[i]);
+                      } else {
+                          Serial.printf("Marcia %d: non calibrata\n", i);
+                      }
+                  }
+              }
+              else if (input.startsWith("gear_cal ")) {
+                  int gear = atoi(input.c_str() + 8);
+                  if (gear >= 1 && gear <= 5) {
+                      if (gearEstimatorStartCapture(gear)) {
+                          // I messaggi sono già dentro gearEstimatorStartCapture()
+                      } else {
+                          Serial.println("Errore: acquisizione già in corso.");
+                      }
+                  } else {
+                      Serial.println("Uso: gear_cal <1..5>");
+                  }
+              }
+              else if (input == "gear_save") {
+                  if (gearEstimatorSaveCapturedGear()) {
+                      // Il messaggio di successo è già stampato all'interno di gearEstimatorSaveCapturedGear()
+                  } else {
+                      // Il messaggio di fallimento è già stampato all'interno
+                  }
+              }
+              else if (input == "gear_reset") {
+                  gearEstimatorResetCalibration();
+                  Serial.println("Calibrazione marce resettata.");
+              }
+              // --- Altri comandi ---
+              else if (input == "help") {
+                  Serial.println("Comandi disponibili:");
+                  Serial.println("  cal_gyro         - calibra giroscopio");
+                  Serial.println("  cal_acc          - calibra accelerometro");
+                  Serial.println("  set_mounting R P - imposta offset mounting");
+                  Serial.println("  save_cal         - salva calibrazione IMU");
+                  Serial.println("  reset_cal        - resetta calibrazione IMU");
+                  Serial.println("  show_cal         - mostra parametri IMU e time sync");
+                  Serial.println("  gear_help        - aiuto per calibrazione marce");
+                  Serial.println("  help             - questo messaggio");
+              }
+              else {
+                  Serial.println("Comando sconosciuto. Digitare 'help'.");
+              }
           }
-        }
-        else if (input == "cal_acc") {
-          Serial.println("Esecuzione calibrazione accelerometro (veicolo fermo e in piano)...");
-          if (imuRunAccelCalibration()) {
-            imuSaveCalibration();
-            Serial.println("Calibrazione accelerometro completata e salvata.");
-          } else {
-            Serial.println("Errore calibrazione accelerometro.");
-          }
-        }
-        else if (input.startsWith("set_mounting")) {
-          float roll, pitch;
-          if (sscanf(input.c_str(), "set_mounting %f %f", &roll, &pitch) == 2) {
-            imuSetMountingAlignment(roll, pitch);
-            imuSaveCalibration();
-            Serial.printf("Mounting impostato: roll=%.2f, pitch=%.2f\n", roll, pitch);
-          } else {
-            Serial.println("Uso: set_mounting <roll_deg> <pitch_deg>");
-          }
-        }
-        else if (input == "save_cal") {
-          if (imuSaveCalibration()) Serial.println("Calibrazione salvata in NVS.");
-          else Serial.println("Errore salvataggio.");
-        }
-        else if (input == "reset_cal") {
-          imuResetCalibration();
-          Serial.println("Calibrazione resettata a default.");
-        }
-        else if (input == "show_cal") {
-          ImuCalibrationInfo info = imuGetCalibrationInfo();
-          Serial.println("--- Calibrazione IMU ---");
-          Serial.printf("Valida in NVS: %s\n", info.hasValidCalibration ? "si" : "no");
-          Serial.printf("Usa default: %s\n", info.usingDefaults ? "si" : "no");
-          Serial.printf("Gyro bias (LSB): %.1f, %.1f, %.1f\n", info.gyroBiasX, info.gyroBiasY, info.gyroBiasZ);
-          Serial.printf("Acc bias (LSB): %.1f, %.1f, %.1f\n", info.accBiasX, info.accBiasY, info.accBiasZ);
-          Serial.printf("Acc scale: %.4f, %.4f, %.4f\n", info.accScaleX, info.accScaleY, info.accScaleZ);
-          Serial.printf("Mounting (deg): roll=%.2f, pitch=%.2f\n", info.mountingRoll, info.mountingPitch);
-          TimeSyncStatus ts = timeSyncGetStatus();
-          Serial.printf("Time sync: valid=%d quality=%d offset=%lld lastSync=%llu\n",
-                        ts.utcValid, ts.quality, ts.utcOffsetUs, ts.lastSyncMonoUs);
-        }
-        else if (input == "help") {
-          Serial.println("Comandi disponibili:");
-          Serial.println("  cal_gyro         - calibra giroscopio (veicolo fermo)");
-          Serial.println("  cal_acc          - calibra accelerometro (veicolo fermo e in piano)");
-          Serial.println("  set_mounting R P - imposta offset mounting (gradi)");
-          Serial.println("  save_cal         - salva parametri correnti in NVS");
-          Serial.println("  reset_cal        - resetta a default e salva");
-          Serial.println("  show_cal         - mostra parametri attuali");
-          Serial.println("  help             - questo messaggio");
-        }
-        else if (input == "gear_help") {
-          Serial.println("Comandi marcia:");
-          Serial.println("  gear_show           - mostra calibrazione corrente");
-          Serial.println("  gear_cal <1..5>     - prepara calibrazione per una marcia");
-          Serial.println("  gear_capture        - acquisisce finestra stabile (2 sec)");
-          Serial.println("  gear_save           - salva in NVS la calibrazione acquisita");
-          Serial.println("  gear_reset          - cancella tutte le calibrazioni");
-        }
-        else if (input == "gear_show") {
-          GearCalibrationInfo info = gearEstimatorGetCalibrationInfo();
-          Serial.println("--- Calibrazione marce ---");
-          Serial.printf("Valida: %s\n", info.hasValidCalibration ? "si" : "no");
-          for (int i=1; i<=5; i++) {
-            if (info.validForGear[i])
-              Serial.printf("Marcia %d: ratio K = %.2f (RPM/km/h)\n", i, info.ratioForGear[i]);
-            else
-              Serial.printf("Marcia %d: non calibrata\n", i);
-          }
-        }
-        else if (input.startsWith("gear_cal ")) {
-          int gear = atoi(input.c_str() + 8);
-          if (gear >= 1 && gear <= 5) {
-            if (gearEstimatorStartCapture(gear)) {
-              Serial.printf("Calibrazione marcia %d avviata. Quando stabile, inviare 'gear_capture'.\n", gear);
-            } else {
-              Serial.println("Errore: acquisizione già in corso.");
-            }
-          } else {
-            Serial.println("Uso: gear_cal <1..5>");
-          }
-        }
-        else if (input == "gear_capture") {
-          if (!gearEstimatorIsCapturing()) {
-            Serial.println("Nessuna calibrazione attiva. Usare 'gear_cal <n>' prima.");
-          } else {
-            // La capture avviene in background, ma per semplificare attendiamo che finisca
-            // (l'utente deve attendere 2 secondi). Possiamo anche fare polling.
-            // Per evitare blocchi, stampiamo solo lo stato dopo la fine asincrona.
-            // Qui forziamo un'attesa breve (meglio gestire asincrono, ma per demo va bene)
-            Serial.println("Acquisizione in corso (2 secondi)... attendere.");
-            // La funzione captureAccumulate verrà chiamata nel loop, quindi non blocchiamo.
-            // L'utente deve solo inviare gear_capture e poi dopo 2 secondi chiedere gear_save.
-            // Aggiungiamo un messaggio per indicare di attendere.
-          }
-        }
-        else if (input == "gear_save") {
-          float ratio, speedAvg, rpmAvg;
-          if (gearEstimatorGetCaptureResult(ratio, speedAvg, rpmAvg)) {
-            // Dobbiamo sapere per quale marcia era stata avviata la capture.
-            // La variabile s_captureGear non è accessibile, quindi la recuperiamo tramite una funzione ad hoc.
-            // Aggiungiamo una funzione di supporto in gear_estimator: int gearEstimatorGetCapturingGear()
-            // Per semplicità, qui la omettiamo; l'utente deve ricordarsi la marcia.
-            // Implementiamo una soluzione: mostriamo il rapporto e chiediamo di specificare la marcia.
-            Serial.printf("Acquisizione stabile: ratio = %.2f (speed=%.1f km/h, rpm=%.0f)\n", ratio, speedAvg, rpmAvg);
-            Serial.println("Per salvare, usare 'gear_set <marcia> <ratio>' oppure rieseguire 'gear_cal' e 'gear_capture'.");
-            // Alternativa: aggiungere comando gear_set
-          } else {
-            Serial.println("Nessuna acquisizione valida disponibile. Eseguire prima 'gear_cal' e 'gear_capture'.");
-          }
-        }
-        else if (input.startsWith("gear_set ")) {
-          int gear; float ratio;
-          if (sscanf(input.c_str(), "gear_set %d %f", &gear, &ratio) == 2 && gear>=1 && gear<=5) {
-            gearEstimatorSetRatioForGear(gear, ratio);
-            Serial.printf("Marcia %d impostata manualmente con ratio = %.2f\n", gear, ratio);
-          } else {
-            Serial.println("Uso: gear_set <1..5> <ratio>");
-          }
-        }
-        else if (input == "gear_reset") {
-          gearEstimatorResetCalibration();
-        }
-        else {
-          Serial.println("Comando sconosciuto. Digitare 'help'.");
-        }
+          input = "";
+      } else if (c != '\r') {
+          input += c;
+          if (input.length() > 64) input = "";
       }
-      input = "";
-    } else if (c != '\r') {
-      input += c;
-      if (input.length() > 64) input = "";
-    }
   }
 }
 

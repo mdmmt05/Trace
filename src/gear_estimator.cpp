@@ -4,6 +4,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <math.h>
+#include <float.h>
 
 // ---------------------------------------------------------------------------
 // NVS
@@ -42,7 +43,13 @@ static const unsigned long CAPTURE_DURATION_MS = 2000; // 2 secondi
 static float s_speedSum = 0.0f;
 static float s_rpmSum = 0.0f;
 static float s_lonAccSum = 0.0f;
-static int   s_sampleCount = 0.0f;
+static int   s_sampleCount = 0;
+
+// Min/Max per stabilità
+static float s_speedMin = FLT_MAX;
+static float s_speedMax = -FLT_MAX;
+static float s_rpmMin   = FLT_MAX;
+static float s_rpmMax   = -FLT_MAX;
 
 static bool s_captureFinished = false;
 static bool s_captureStable = false;
@@ -54,9 +61,11 @@ static float s_capturedRpmAvg = 0.0f;
 // Helper checksum (XOR a 16 bit)
 // ---------------------------------------------------------------------------
 static uint16_t computeChecksum(const GearCalibrationData& data) {
-    const uint8_t* ptr = (const uint8_t*)&data;
+    GearCalibrationData tmp = data;
+    tmp.checksum = 0;
+    const uint8_t* ptr = (const uint8_t*)&tmp;
     uint16_t sum = 0;
-    for (size_t i = 0; i < sizeof(GearCalibrationData) - sizeof(data.checksum); i++) {
+    for (size_t i = 0; i < sizeof(GearCalibrationData); i++) {
         sum ^= ptr[i];
     }
     return sum;
@@ -150,8 +159,18 @@ bool gearEstimatorStartCapture(int gear) {
     s_rpmSum = 0.0f;
     s_lonAccSum = 0.0f;
     s_sampleCount = 0;
+    s_speedMin = FLT_MAX;
+    s_speedMax = -FLT_MAX;
+    s_rpmMin   = FLT_MAX;
+    s_rpmMax   = -FLT_MAX;
     s_captureFinished = false;
     s_captureStable = false;
+    s_capturedRatio = 0.0f;
+    s_capturedSpeedAvg = 0.0f;
+    s_capturedRpmAvg = 0.0f;
+
+    Serial.printf("[GEAR] Marcia %d: mantieni velocità stabile per ~2 secondi...\n", gear);
+    Serial.println("[GEAR] Attendere acquisizione automatica, poi usare 'gear_save'");
     return true;
 }
 
@@ -164,37 +183,32 @@ void gearEstimatorAbortCapture() {
     s_captureFinished = false;
 }
 
+int gearEstimatorGetCapturingGear() {
+    return s_captureGear;
+}
+
 // ---------------------------------------------------------------------------
 // Chiamata internamente da gearEstimatorUpdate per accumulare campioni
 // ---------------------------------------------------------------------------
 static void captureAccumulate() {
     if (!s_captureActive) return;
     unsigned long now = millis();
-    if (now - s_captureStartMs >= CAPTURE_DURATION_MS) {
+    bool timeExpired = (now - s_captureStartMs >= CAPTURE_DURATION_MS);
+
+    if (timeExpired) {
         // Finestra terminata: valuta stabilità
         if (s_sampleCount >= 10) { // almeno 10 campioni validi
             float speedMean = s_speedSum / s_sampleCount;
             float rpmMean = s_rpmSum / s_sampleCount;
             float lonAccMean = s_lonAccSum / s_sampleCount;
 
-            // Calcolo varianze approssimative (per semplicità usiamo range)
-            // Più robusto: controlliamo che max-min sia piccolo
-            // Qui usiamo un indicatore: se la deviazione standard stimata è bassa.
-            // Per semplicità implementiamo controllo su range (memorizziamo min/max)
-            // Alternativa: usare solo lonAcc e delta tra primo e ultimo campione.
-            // Scegliamo di richiedere che lonAcc media sia < 0.1G e che
-            // la differenza tra primo e ultimo campione di speed sia < 2 km/h.
-            // Conserviamo i primi valori per fare questo controllo.
-            static float firstSpeed = 0, firstRpm = 0;
-            static bool firstSample = true;
-            if (firstSample) {
-                firstSpeed = speedMean;
-                firstRpm = rpmMean;
-                firstSample = false;
-            }
-            float speedDrift = fabsf(speedMean - firstSpeed);
-            float rpmDrift = fabsf(rpmMean - firstRpm);
-            bool stable = (fabsf(lonAccMean) < 0.1f) && (speedDrift < 2.0f) && (rpmDrift < 200.0f);
+            // Calcola delta speed e delta rpm
+            float speedDelta = s_speedMax - s_speedMin;
+            float rpmDelta   = s_rpmMax - s_rpmMin;
+
+            bool stable = (fabsf(lonAccMean) < 0.1f) &&
+                          (speedDelta < 2.0f) &&
+                          (rpmDelta < 200.0f);
 
             if (stable && speedMean > GEAR_MIN_SPEED && rpmMean > GEAR_MIN_RPM) {
                 s_capturedRatio = rpmMean / speedMean;
@@ -222,6 +236,12 @@ static void captureAccumulate() {
         s_rpmSum += rpm;
         s_lonAccSum += lonAcc;
         s_sampleCount++;
+
+        // Aggiorna min/max
+        if (speed < s_speedMin) s_speedMin = speed;
+        if (speed > s_speedMax) s_speedMax = speed;
+        if ((float)rpm < s_rpmMin) s_rpmMin = (float)rpm;
+        if ((float)rpm > s_rpmMax) s_rpmMax = (float)rpm;
     }
 }
 
@@ -234,14 +254,37 @@ bool gearEstimatorGetCaptureResult(float &ratio, float &speedAvg, float &rpmAvg)
     return true;
 }
 
-void gearEstimatorSetRatioForGear(int gear, float ratio) {
-    if (gear < 1 || gear > GEAR_MAX_GEARS) return;
-    s_calib.gears[gear].ratioK = ratio;
+bool gearEstimatorSaveCapturedGear() {
+    if (!s_captureFinished || !s_captureStable) {
+        Serial.println("[GEAR] Nessuna acquisizione valida da salvare.");
+        return false;
+    }
+    int gear = s_captureGear;
+    if (gear < 1 || gear > GEAR_MAX_GEARS) {
+        Serial.println("[GEAR] Marcia acquisita non valida.");
+        return false;
+    }
+
+    // Salva i dati completi
+    s_calib.gears[gear].ratioK = s_capturedRatio;
+    s_calib.gears[gear].speedRefKmh = s_capturedSpeedAvg;
+    s_calib.gears[gear].rpmRef = s_capturedRpmAvg;
     s_calib.gears[gear].valid = true;
-    // opzionale: salva anche i valori di riferimento (non obbligatorio)
-    s_calib.gears[gear].speedRefKmh = 0;   // non usati runtime
-    s_calib.gears[gear].rpmRef = 0;
     s_calib.valid = true;
+
+    bool ok = saveToNVS();
+    if (ok) {
+        Serial.printf("[GEAR] Calibrazione marcia %d salvata: ratio=%.2f, speed=%.1f km/h, rpm=%.0f\n",
+                      gear, s_capturedRatio, s_capturedSpeedAvg, s_capturedRpmAvg);
+    } else {
+        Serial.println("[GEAR] ERRORE: salvataggio in NVS fallito.");
+    }
+
+    // Resetta lo stato di cattura per evitare ri-salvataggi accidentali
+    s_captureFinished = false;
+    s_captureStable = false;
+    s_captureActive = false;
+    return ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +400,8 @@ GearCalibrationInfo gearEstimatorGetCalibrationInfo() {
     for (int i = 1; i <= GEAR_MAX_GEARS; i++) {
         info.ratioForGear[i] = s_calib.gears[i].ratioK;
         info.validForGear[i] = s_calib.gears[i].valid;
+        info.speedRefForGear[i] = s_calib.gears[i].speedRefKmh; 
+        info.rpmRefForGear[i] = s_calib.gears[i].rpmRef;
     }
     return info;
 }
