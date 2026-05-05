@@ -9,6 +9,10 @@
 
 #include <Arduino.h>
 
+#ifndef RGB_RPM_WARNING_DEFAULT
+#define RGB_RPM_WARNING_DEFAULT true   // Default all'avvio: avviso RPM attivo
+#endif
+
 // ---------------------------------------------------------------------------
 // Modalità disponibili
 // ---------------------------------------------------------------------------
@@ -16,8 +20,6 @@ enum RgbMode {
     RGB_STATIC = 0, // Colore fisso
     RGB_FADING,       // Transizione ciclica tra colori
     RGB_BREATHING,    // Fade in-out su colore fisso
-    RGB_RPM_COLOR,    // Gradiente freddo→caldo in base agli RPM
-    RGB_RPM_WARNING,  // Lampeggio rosso al superamento soglia RPM
     RGB_MODE_COUNT    // Sentinella — tieni sempre per ultima
 };
 
@@ -28,7 +30,7 @@ extern const char* const RgbModeNames[RGB_MODE_COUNT];
 // Parametri configurabili a runtime via webserver
 // ---------------------------------------------------------------------------
 struct RgbParams {
-    // Colore base (usato da STATIC, BREATHING, RPM_WARNING)
+    // Colore base (usato da STATIC, BREATHING)
     uint8_t r = 255;
     uint8_t g = 255;
     uint8_t b = 255;
@@ -39,11 +41,14 @@ struct RgbParams {
     // Luminosità globale (0 - 100 %)
     uint8_t brightness = 100;
 
-    // Soglia RPM per RGB_RPM_WARNING
+    // Soglia RPM per overlay avviso (shift light)
     int rpmThreshold = 6000;
 
-    // RPM massimi di riferimento per RGB_RPM_COLOR
-    int rpmMax = 8000;
+    // Abilitazione overlay avviso RPM (true = attivo, false = disattivo)
+    bool rpmWarningEnabled = RGB_RPM_WARNING_DEFAULT; // default controllato da define
+
+    // Valore legacy - non più utilizzato
+    // int rpmMax = 8000;
 };
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,11 @@
 #include "rgb_controller.h"
 #include "shared_data.h"
 
+// Default per overlay RPM (se non definito esternamente)
+#ifndef RGB_RPM_WARNING_DEFAULT
+#define RGB_RPM_WARNING_DEFAULT true
+#endif
+
 // ---------------------------------------------------------------------------
 // Nomi modalità (indice = valore enum)
 // ---------------------------------------------------------------------------
@@ -12,8 +17,6 @@ const char* const RgbModeNames[RGB_MODE_COUNT] = {
   "STATIC",
   "FADING",
   "BREATHING",
-  "RPM_COLOR",
-  "RPM_WARNING"
 };
 
 // ---------------------------------------------------------------------------
@@ -158,45 +161,37 @@ static void _updateBreathing() {
 }
 
 // ---------------------------------------------------------------------------
-// Algoritmo: RPM_COLOR
-// Hue scala da blu (0 rpm) → verde → giallo → rosso (rpmMax).
-// Saturazione e valore fissi. L'effetto è un "termometro" visivo dei giri.
+// Overlay: Avviso RPM (shift light)
+// Se abilitato e RPM >= soglia, lampeggia rosso.
+// Restituisce true se l'overlay è attivo (ha sovrascritto l'effetto base)
 // ---------------------------------------------------------------------------
-static void _updateRpmColor() {
-    int rpm = constrain(vehicleData.rpm, 0, _params.rpmMax);
+static bool _applyRpmWarningOverlay() {
+    if (!_params.rpmWarningEnabled) return false;
+    if (vehicleData.rpm < _params.rpmThreshold) return false;
 
-    // Hue: 240° (blu) a 0° (rosso) — invertito perché HSV va rosso→blu
-    float hue = map(rpm, 0, _params.rpmMax, 240, 0);
+    // Lampeggio: 120ms ON / 120ms OFF
+    const unsigned long blinkInterval = 120;
+    bool blinkOn = (millis() / blinkInterval) % 2 == 0;
 
-    uint8_t r, g, b;
-    _hsvToRgb(hue, 1.0f, 1.0f, r, g, b);
-    _writeLed(r, g, b);
-}
-
-// ---------------------------------------------------------------------------
-// Algoritmo: RPM_WARNING
-// Sotto soglia: colore base.
-// Sopra soglia: lampeggio rosso rapido.
-// ---------------------------------------------------------------------------
-static void _updateRpmWarning() {
-    if (vehicleData.rpm < _params.rpmThreshold) {
-        _writeLed(_params.r, _params.g, _params.b);
-        return;
-    }
-
-    // Lampeggio: 150ms on / 150ms off
-    bool blink = (millis() / 150) % 2 == 0;
-    if (blink) {
-      _writeLed(255, 0, 0);
+    if (blinkOn) {
+        // Rosso pieno con luminosità scala
+        uint8_t r = (uint8_t)(255 * (_params.brightness / 100.0f));
+        // Common anode: 255 - valore
+        ledcWrite(LEDC_CH_R, 255 - r);
+        ledcWrite(LEDC_CH_G, 255);
+        ledcWrite(LEDC_CH_B, 255);
     } else {
-      _writeLed(0, 0, 0);
+        // Spento
+        ledcWrite(LEDC_CH_R, 255);
+        ledcWrite(LEDC_CH_G, 255);
+        ledcWrite(LEDC_CH_B, 255);
     }
+    return true;
 }
 
 // ===========================================================================
 // API pubblica
 // ===========================================================================
-
 void rgbInit(int pinR, int pinG, int pinB) {
     _pinR = pinR;
     _pinG = pinG;
@@ -214,12 +209,14 @@ void rgbInit(int pinR, int pinG, int pinB) {
 }
 
 void rgbUpdate() {
+    // Prima controlla l'overlay RPM; se attivo, salta la modalità base
+    if (_applyRpmWarningOverlay()) return;
+
+    // Altrimenti esegui la modalità selezionata
     switch (_mode) {
       case RGB_STATIC:      _updateStatic();      break;
       case RGB_FADING:      _updateFading();      break;
       case RGB_BREATHING:   _updateBreathing();   break;
-      case RGB_RPM_COLOR:   _updateRpmColor();    break;
-      case RGB_RPM_WARNING: _updateRpmWarning();  break;
       default: break;
     }
 }
@@ -233,6 +230,8 @@ RgbMode rgbGetMode() {
 }
   
 void rgbSetParams(const RgbParams& params) {
+    // Conserva il vecchio stato per i campi che potrebbero non essere stati passati
+    // (in realtà il chiamante passa l'intera struct, ma lasciamo così per coerenza)
     _params = params;
 }
   

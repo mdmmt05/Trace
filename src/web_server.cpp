@@ -556,6 +556,61 @@ static const char UI_HTML[] PROGMEM = R"rawhtml(
     transition: border-color 0.2s;
   }
   .number-field input:focus { border-color: var(--accent-d); }
+
+  .toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 20px;
+    background: var(--bg3);
+    padding: 12px 16px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+  }
+  
+  .toggle-label {
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text2);
+  }
+  
+  .toggle-desc {
+    font-size: 0.58rem;
+    color: var(--text3);
+    margin-top: 4px;
+  }
+  
+  .toggle-switch {
+    position: relative;
+    width: 52px;
+    height: 28px;
+    background: var(--bg4);
+    border-radius: 50px;
+    cursor: pointer;
+    transition: background 0.2s;
+    border: 1px solid var(--border2);
+  }
+  
+  .toggle-switch.active {
+    background: var(--accent);
+  }
+  
+  .toggle-knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 22px;
+    height: 22px;
+    background: white;
+    border-radius: 50%;
+    transition: transform 0.2s;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+  }
+  
+  .toggle-switch.active .toggle-knob {
+    transform: translateX(24px);
+  }
   
   .rpm-note {
     font-size: 0.6rem;
@@ -721,16 +776,6 @@ static const char UI_HTML[] PROGMEM = R"rawhtml(
             <div class="mode-desc">Luminosità pulsante</div>
             <div class="mode-pip"></div>
           </div>
-          <div class="mode-card" data-mode="RPM_COLOR">
-            <div class="mode-name">RPM colore</div>
-            <div class="mode-desc">Colore legato ai giri</div>
-            <div class="mode-pip"></div>
-          </div>
-          <div class="mode-card" data-mode="RPM_WARNING">
-            <div class="mode-name">Avviso RPM</div>
-            <div class="mode-desc">Lampeggio oltre soglia</div>
-            <div class="mode-pip"></div>
-          </div>
         </div>
       </div>
     </div>
@@ -760,19 +805,25 @@ static const char UI_HTML[] PROGMEM = R"rawhtml(
         </div>
   
         <div class="divider" style="margin-bottom:18px;"></div>
-  
+
+        <!-- toggle Avviso RPM -->
+        <div class="toggle-row" id="rpmWarningToggle">
+          <div>
+            <div class="toggle-label">Avviso RPM</div>
+            <div class="toggle-desc">Lampeggio rosso oltre la soglia</div>
+          </div>
+          <div class="toggle-switch" id="rpmWarningSwitch">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+
         <div class="rpm-note">
-          I parametri RPM sono attivi solo nelle modalità <strong>RPM colore</strong> e <strong>Avviso RPM</strong>.
+          Se attivo, i LED lampeggiano rosso quando gli RPM superano la soglia impostata.
         </div>
   
         <div class="number-field">
           <label>Soglia avviso RPM</label>
           <input type="number" id="rpmThreshold" min="0" max="15000" value="6000">
-        </div>
-  
-        <div class="number-field">
-          <label>RPM scala colore (massimo)</label>
-          <input type="number" id="rpmMax" min="1" max="15000" value="8000">
         </div>
   
         <button class="btn-primary" id="applyParams">Salva impostazioni</button>
@@ -1016,6 +1067,7 @@ static const char UI_HTML[] PROGMEM = R"rawhtml(
     chev.classList.toggle('open');
   });
   
+  // Sliders
   document.getElementById('speedSlider').addEventListener('input', function() {
     document.getElementById('speedVal').textContent = this.value;
   });
@@ -1023,12 +1075,22 @@ static const char UI_HTML[] PROGMEM = R"rawhtml(
     document.getElementById('brightnessVal').textContent = this.value + '%';
   });
   
+  // Toggle RPM Warning
+  const rpmWarningSwitch = document.getElementById('rpmWarningSwitch');
+  let rpmWarningEnabled = true; // default from backend
+  rpmWarningSwitch.addEventListener('click', () => {
+    rpmWarningEnabled = !rpmWarningEnabled;
+    if (rpmWarningEnabled) rpmWarningSwitch.classList.add('active');
+    else rpmWarningSwitch.classList.remove('active');
+  });
+
+  // Apply advanced params (includes toggle)
   document.getElementById('applyParams').addEventListener('click', async () => {
     const params = {
       speed:        clamp(parseInt(document.getElementById('speedSlider').value)||0, 0, 100),
       brightness:   clamp(parseInt(document.getElementById('brightnessSlider').value)||0, 0, 100),
       rpmThreshold: clamp(parseInt(document.getElementById('rpmThreshold').value)||0, 0, 15000),
-      rpmMax:       clamp(parseInt(document.getElementById('rpmMax').value)||1, 1, 15000)
+      rpmWarningEnabled: rpmWarningEnabled
     };
     try {
       const res = await fetch('/api/params', {
@@ -1076,7 +1138,11 @@ static const char UI_HTML[] PROGMEM = R"rawhtml(
       if (d.speed   !== undefined) { document.getElementById('speedSlider').value = d.speed; document.getElementById('speedVal').textContent = d.speed; }
       if (d.brightness !== undefined) { document.getElementById('brightnessSlider').value = d.brightness; document.getElementById('brightnessVal').textContent = d.brightness + '%'; }
       if (d.rpmThreshold !== undefined) document.getElementById('rpmThreshold').value = d.rpmThreshold;
-      if (d.rpmMax !== undefined) document.getElementById('rpmMax').value = d.rpmMax;
+      if (d.rpmWarningEnabled !== undefined) {
+        rpmWarningEnabled = d.rpmWarningEnabled;
+        if (rpmWarningEnabled) rpmWarningSwitch.classList.add('active');
+        else rpmWarningSwitch.classList.remove('active');
+      }
       syncFromRGB();
       if (d.mode) setActiveMode(d.mode);
       setOnline();
@@ -1121,7 +1187,8 @@ static void handleGetStatus() {
     doc["speed"] = p.speed;
     doc["brightness"] = p.brightness;
     doc["rpmThreshold"] = p.rpmThreshold;
-    doc["rpmMax"] = p.rpmMax;
+    // doc["rpmMax"] = p.rpmMax; // mantenuto per retrocompatibilità
+    doc["rpmWarningEnabled"] = p.rpmWarningEnabled;
 
     String out;
     serializeJson(doc, out);
@@ -1162,7 +1229,7 @@ static void handlePostMode() {
     }
   
     const char* modeStr = doc["mode"] | "";
-    RgbMode newMode = RGB_STATIC;
+    RgbMode newMode = RGB_STATIC; // fallback sicuro
     bool found = false;
     for (int i = 0; i < RGB_MODE_COUNT; i++) {
       if (strcmp(modeStr, RgbModeNames[i]) == 0) {
@@ -1171,7 +1238,11 @@ static void handlePostMode() {
         break;
       }
     }
-    if (!found) { server.send(400, "application/json", "{\"error\":\"unknown mode\"}"); return; }
+    // Se la modalità non è riconosciuta, si usa RGB_STATIC senza errore
+    // (così comandi obsoleti come "RPM_COLOR" o "RPM_WARNING" non bloccano)
+    if (!found) {
+      Serial.printf("[WebServer] Modalità sconosciuta: %s, fallback a STATIC\n", modeStr);
+    }
   
     rgbSetMode(newMode);
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1193,7 +1264,8 @@ static void handlePostParams(){
     if (doc["speed"].is<int>())        p.speed        = constrain((int)doc["speed"],        0, 100);
     if (doc["brightness"].is<int>())   p.brightness   = constrain((int)doc["brightness"],   0, 100);
     if (doc["rpmThreshold"].is<int>()) p.rpmThreshold = constrain((int)doc["rpmThreshold"], 0, 15000);
-    if (doc["rpmMax"].is<int>())       p.rpmMax       = constrain((int)doc["rpmMax"],       1, 15000);
+    // if (doc["rpmMax"].is<int>())       p.rpmMax       = constrain((int)doc["rpmMax"],       1, 15000);
+    if (doc["rpmWarningEnabled"].is<bool>()) p.rpmWarningEnabled = doc["rpmWarningEnabled"];
     rgbSetParams(p);
 
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -1210,7 +1282,6 @@ static void handleNotFound() {
 // ===========================================================================
 // API pubblica
 // ===========================================================================
-
 void webServerInit() {
     // Avvia Access Point
     WiFi.mode(WIFI_AP);

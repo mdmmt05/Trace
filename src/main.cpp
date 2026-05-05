@@ -24,6 +24,27 @@ static const int PIN_RGB_G = 5;
 static const int PIN_RGB_B = 6;
 
 // ---------------------------------------------------------------------------
+// Switch di controllo recording
+// ---------------------------------------------------------------------------
+#define PIN_RECORD_SWITCH 7
+
+static bool recordingActive = false;
+static bool fileOpen = false;
+
+static int lastRawSwitchReading = HIGH;     // ultima lettura raw del GPIO
+static int debouncedSwitchState = HIGH;     // stato stabile debounced (pullup, HIGH = OFF)
+static unsigned long lastDebounceTime = 0;
+static const unsigned long debounceDelay = 50;   // ms
+static bool recStartErrorReported = false;        // evita spam seriale su errori persistenti
+
+static bool sdOk = false;               // true se sdInit è riuscita
+
+// ---------------------------------------------------------------------------
+// LED monocromatico di stato (Fase 4B)
+// ---------------------------------------------------------------------------
+#define PIN_REC_LED 8
+
+// ---------------------------------------------------------------------------
 // Costanti sistema
 // ---------------------------------------------------------------------------
 static const unsigned long GNSS_FIX_TIMEOUT_MS = 5UL * 60UL * 1000UL;
@@ -36,18 +57,6 @@ enum SystemState { SYS_WAITING_FIX, SYS_RUNNING };
 static SystemState sysState = SYS_WAITING_FIX;
 
 // ---------------------------------------------------------------------------
-// LED attesa fix: lampeggio rosso non bloccante
-// ---------------------------------------------------------------------------
-static void blinkWaitingFix() {
-  static unsigned long lastBlink = 0;
-  static bool ledOn = false;
-  if (millis() - lastBlink < 500) return;
-  lastBlink = millis();
-  ledOn = !ledOn;
-  ledOn ? rgbSetColor(255, 0, 0) : rgbOff();
-}
-
-// ---------------------------------------------------------------------------
 // Nome file CSV dalla data/ora GNSS
 // ---------------------------------------------------------------------------
 static void buildFilename(char* buf, size_t bufSize) {
@@ -57,9 +66,115 @@ static void buildFilename(char* buf, size_t bufSize) {
 }
 
 // ---------------------------------------------------------------------------
+// Gestione switch recording (debounce e transizioni)
+// ---------------------------------------------------------------------------
+static void updateRecordingSwitch() {
+  int reading = digitalRead(PIN_RECORD_SWITCH);
+  
+  // Debounce: separa lettura raw e stato stabile
+  if (reading != lastRawSwitchReading) {
+    lastDebounceTime = millis();
+    lastRawSwitchReading = reading;
+  }
+      
+  if ((millis() - lastDebounceTime) > debounceDelay &&
+    reading != debouncedSwitchState) {
+    debouncedSwitchState = reading;
+
+    // ON -> OFF: ferma logging e chiudi file
+    if (debouncedSwitchState == HIGH) {
+      if (fileOpen) {
+        sdFlush();
+        sdClose();
+        recordingActive = false;
+        fileOpen = false;
+        Serial.println("[REC] STOP");
+      }
+      recStartErrorReported = false;
+    }
+  }
+
+  // Switch ON: avvia logging solo quando il sistema è realmente pronto.
+  // Questo evita filename 00000000_000000.csv se lo switch è già ON al boot.
+  if (debouncedSwitchState == LOW && !fileOpen && !recordingActive) {
+    if (sysState != SYS_RUNNING) {
+      if (!recStartErrorReported) {
+        Serial.println("[REC] WAITING FIX");
+        recStartErrorReported = true;
+      }
+      return;
+    }
+
+    if (!sdOk) {
+      if (!recStartErrorReported) {
+        Serial.println("[REC] SD ERROR");
+        recStartErrorReported = true;
+      }
+      return;
+    }
+
+    char filename[32];
+    buildFilename(filename, sizeof(filename));
+    if (sdOpenFile(filename)) {
+      recordingActive = true;
+      fileOpen = true;
+      recStartErrorReported = false;
+      Serial.println("[REC] START");
+    } else {
+      recordingActive = false;
+      fileOpen = false;
+      if (!recStartErrorReported) {
+        Serial.println("[REC] SD ERROR");
+        recStartErrorReported = true;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gestione LED monocromatico di stato (Fase 4B)
+// ---------------------------------------------------------------------------
+static void updateRecordingLed() {
+    static unsigned long lastBlink = 0;
+    static bool ledState = false;
+
+    // Caso 1: switch spento -> LED spento
+    if (debouncedSwitchState == HIGH) {
+        digitalWrite(PIN_REC_LED, LOW);
+        return;
+    }
+
+    // Caso 2: recording attivo -> LED fisso acceso
+    if (recordingActive) {
+        digitalWrite(PIN_REC_LED, HIGH);
+        return;
+    }
+
+    // Determinazione pattern di lampeggio (millis non bloccante)
+    unsigned long interval = 0;
+    if (!sdOk) {
+        interval = 500;          // 1 Hz (500ms ON / 500ms OFF)
+    } else if (sysState != SYS_RUNNING) {
+        interval = 250;          // 2 Hz (250ms ON / 250ms OFF)
+    } else {
+        // Switch ON ma non in registrazione e nessuna condizione di errore/attesa:
+        // teoricamente non accade, ma per sicurezza LED spento
+        digitalWrite(PIN_REC_LED, LOW);
+        return;
+    }
+
+    // Lampeggio non bloccante
+    unsigned long now = millis();
+    if (now - lastBlink >= interval) {
+        lastBlink = now;
+        ledState = !ledState;
+        digitalWrite(PIN_REC_LED, ledState ? HIGH : LOW);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Gestione comandi seriali per calibrazione IMU (commissioning)
 // ---------------------------------------------------------------------------
-
 static void handleSerialCommands() {
   static String input = "";
   while (Serial.available()) {
@@ -209,24 +324,34 @@ void setup() {
   // sono ok perché obd2Update() non è ancora nel loop.
   if (!imuInit()) {
     // IMU non trovata: continua senza dati IMU (campi a 0 nel CSV)
-    rgbSetColor(255, 128, 0);   // LED arancione = warning IMU assente
-    delay(2000);
+    Serial.println("[WARN] IMU non rilevata, si continua senza.");
   }
   esp_task_wdt_reset(); // feed watchdog dopo calibrazione
 
   vehicleFusionInit();
   gearEstimatorInit();
+
+  // Inizializzazione SD
   if (!sdInit()) {
-    // Serial.println("[SD] Init fallita");   // <-- commentato in modalità UART sim
+    Serial.println("[SD] Init fallita");   // <-- commentato in modalità UART sim
     // SD non presente o corrotta: segnala con LED rosso lampeggiante 3×
-    for (int i = 0; i < 3; i++) {
-      rgbSetColor(255, 0, 0); delay(200);
-      rgbOff();               delay(200);
-    }
+    sdOk = false;
     // Il sistema continua — GNSS e OBD2 funzionano, solo il logging è disabilitato
+  } else {
+    sdOk = true;
   }
 
   webServerInit();
+
+  // Configurazione switch
+  pinMode(PIN_RECORD_SWITCH, INPUT_PULLUP);
+  lastRawSwitchReading = digitalRead(PIN_RECORD_SWITCH);
+  debouncedSwitchState = lastRawSwitchReading;
+  lastDebounceTime = millis();
+
+  // Configurazione LED monocromatico di stato (Fase 4B)
+  pinMode(PIN_REC_LED, OUTPUT);
+  digitalWrite(PIN_REC_LED, LOW);
 
   // Serial.println("[SYS] In attesa del fix GNSS...");
   Serial.println("[SYS] Pronto. Comandi seriali disponibili (help).");
@@ -255,22 +380,14 @@ void loop() {
 
   // ── ATTESA FIX ────────────────────────────────────────────────────────────
   if (sysState == SYS_WAITING_FIX) {
-    blinkWaitingFix();
+    updateRecordingSwitch();
+    updateRecordingLed();
 
     bool fixOk    = gnssHasFix();
     bool timedOut = (millis() > GNSS_FIX_TIMEOUT_MS);
 
     if (!fixOk && !timedOut) return;
 
-    char filename[32];
-    if (fixOk) {
-      buildFilename(filename, sizeof(filename));
-    } else {
-      snprintf(filename, sizeof(filename), "/nognss_%lu.csv", millis());
-    }
-
-    sdOpenFile(filename);
-    rgbSetMode(rgbGetMode());
     sysState = SYS_RUNNING;
     return;
   }
@@ -278,55 +395,64 @@ void loop() {
   // ── RUNNING ───────────────────────────────────────────────────────────────
   rgbUpdate();
 
+  // Gestione switch di recording (debounce e apertura/chiusura file)
+  updateRecordingSwitch();
+
+  // Gestione LED monocromatico di stato (Fase 4B)
+  updateRecordingLed();
+
   static unsigned long lastLog = 0;
   unsigned long now = millis();
   if (now - lastLog < LOG_INTERVAL_MS) return;
   lastLog = now;
 
-  // Acquisizione snapshot temporale
-  uint64_t logMonoUs = timeSyncNowUs();
-  GnssData   g = gnssGetData();
-  ImuData   imu = imuGetData();
-  VehicleState vf = vehicleFusionGetState();
-  VehicleData vd;   // copia locale dei dati condivisi (per coerenza)
-  noInterrupts();
-  vd = vehicleData;
-  interrupts();
+  // Scrive su SD solo se il recording è attivo
+  if (recordingActive) {
+    // Acquisizione snapshot temporale
+    uint64_t logMonoUs = timeSyncNowUs();
+    GnssData   g = gnssGetData();
+    ImuData   imu = imuGetData();
+    VehicleState vf = vehicleFusionGetState();
+    VehicleData vd;   // copia locale dei dati condivisi (per coerenza)
+    noInterrupts();
+    vd = vehicleData;
+    interrupts();
 
-  // Calcolo età campioni
-  int imuAgeMs = (imu.lastSampleMonoUs != 0) ? (int)((logMonoUs - imu.lastSampleMonoUs) / 1000) : -1;
-  int gnssAgeMs = (g.fixRxMonoUs != 0) ? (int)((logMonoUs - g.fixRxMonoUs) / 1000) : -1;
-  int obdSpeedAgeMs = (vd.speedTimestampUs != 0) ? (int)((logMonoUs - vd.speedTimestampUs) / 1000) : -1;
+    // Calcolo età campioni
+    int imuAgeMs = (imu.lastSampleMonoUs != 0) ? (int)((logMonoUs - imu.lastSampleMonoUs) / 1000) : -1;
+    int gnssAgeMs = (g.fixRxMonoUs != 0) ? (int)((logMonoUs - g.fixRxMonoUs) / 1000) : -1;
+    int obdSpeedAgeMs = (vd.speedTimestampUs != 0) ? (int)((logMonoUs - vd.speedTimestampUs) / 1000) : -1;
 
-  // UTC stimata e qualità sync
-  int64_t utcUs = timeSyncMonoToUtcUs(logMonoUs);
-  TimeSyncStatus ts = timeSyncGetStatus();
+    // UTC stimata e qualità sync
+    int64_t utcUs = timeSyncMonoToUtcUs(logMonoUs);
+    TimeSyncStatus ts = timeSyncGetStatus();
 
-  // Timestamp stringa per compatibilità (opzionale, possiamo usare gnssFormatTimestamp)
-  char tsStr[20];
-  gnssFormatTimestamp(tsStr, sizeof(tsStr));
+    // Timestamp stringa per compatibilità (opzionale, possiamo usare gnssFormatTimestamp)
+    char tsStr[20];
+    gnssFormatTimestamp(tsStr, sizeof(tsStr));
 
-  sdWriteRow(tsStr,
-    g.lat, g.lon, g.altMeters,
-    g.satellites, g.hdop,
-    vd.speed,
-    imu.lonAcc,  imu.latAcc,
-    imu.roll,    imu.pitch,
-    imu.slope,   imu.slopeConfidence,
-    vf.heading_deg, vf.yawRate_dps, vf.headingConfidence,
-    vd.rpm,
-    vd.load,
-    vd.throttle,
-    vd.gearEstimated,
-    logMonoUs,
-    utcUs,
-    ts.utcValid,
-    ts.quality,
-    imu.lastSampleMonoUs,
-    g.fixRxMonoUs,
-    vd.speedTimestampUs,
-    imuAgeMs,
-    gnssAgeMs,
-    obdSpeedAgeMs
-  );
+    sdWriteRow(tsStr,
+      g.lat, g.lon, g.altMeters,
+      g.satellites, g.hdop,
+      vd.speed,
+      imu.lonAcc,  imu.latAcc,
+      imu.roll,    imu.pitch,
+      imu.slope,   imu.slopeConfidence,
+      vf.heading_deg, vf.yawRate_dps, vf.headingConfidence,
+      vd.rpm,
+      vd.load,
+      vd.throttle,
+      vd.gearEstimated,
+      logMonoUs,
+      utcUs,
+      ts.utcValid,
+      ts.quality,
+      imu.lastSampleMonoUs,
+      g.fixRxMonoUs,
+      vd.speedTimestampUs,
+      imuAgeMs,
+      gnssAgeMs,
+      obdSpeedAgeMs
+    );
+  }
 }

@@ -7,10 +7,10 @@
 //
 // Endpoints:
 //   GET  /            → Pagina HTML completa
-//   GET  /api/status  → Stato attuale (mode, r, g, b, speed, brightness, ...)
+//   GET  /api/status  → Stato attuale (mode, r, g, b, speed, brightness, rpmThreshold, rpmWarningEnabled)
 //   POST /api/color   → {"r":255,"g":0,"b":128}
 //   POST /api/mode    → {"mode":"FADING"}
-//   POST /api/params  → {"speed":50,"brightness":100,"rpmThreshold":4000,"rpmMax":7000}
+//   POST /api/params  → {"speed":50,"brightness":100,"rpmThreshold":4000,"rpmWarningEnabled":true}
 // ---------------------------------------------------------------------------
 
 // Inizializza Access Point e webserver. Chiamare nel setup().
