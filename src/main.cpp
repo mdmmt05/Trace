@@ -17,6 +17,12 @@
 VehicleData vehicleData;
 
 // ---------------------------------------------------------------------------
+// Variabili globali condivise per lo stato di registrazione
+// ---------------------------------------------------------------------------
+volatile bool recordingActive = false;
+volatile bool fileOpen = false;
+
+// ---------------------------------------------------------------------------
 // Pin RGB — modifica con i pin definitivi
 // ---------------------------------------------------------------------------
 static const int PIN_RGB_R = 4;
@@ -27,9 +33,6 @@ static const int PIN_RGB_B = 6;
 // Switch di controllo recording
 // ---------------------------------------------------------------------------
 #define PIN_RECORD_SWITCH 7
-
-static bool recordingActive = false;
-static bool fileOpen = false;
 
 static int lastRawSwitchReading = HIGH;     // ultima lettura raw del GPIO
 static int debouncedSwitchState = HIGH;     // stato stabile debounced (pullup, HIGH = OFF)

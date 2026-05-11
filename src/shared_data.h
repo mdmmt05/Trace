@@ -46,3 +46,9 @@ struct VehicleData {
 };
 
 extern VehicleData vehicleData;
+
+// ---------------------------------------------------------------------------
+// Stato di registrazione (condiviso tra main.cpp e web_server.cpp)
+// ---------------------------------------------------------------------------
+extern volatile bool recordingActive;
+extern volatile bool fileOpen;

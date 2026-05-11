@@ -1,5 +1,7 @@
 #pragma once
 
+#include <Arduino.h>
+
 // ---------------------------------------------------------------------------
 // web_server.h
 // WebServer in modalità Access Point per controllo LED RGB via browser.
@@ -18,3 +20,6 @@ void webServerInit();
 
 // Gestisce le richieste in arrivo. Chiamare nel loop() senza delay.
 void webServerHandle();
+
+// Helper pubblici (opzionali, usati internamente)
+bool isSafeCsvFilename(const String& name);
