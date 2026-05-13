@@ -1,3 +1,6 @@
+// Header esclusi: 4795 righe
+// Header inclusi: 5390 righe
+
 #include <Arduino.h>
 #include <esp_task_wdt.h>
 #include "shared_data.h"
