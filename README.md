@@ -145,202 +145,456 @@ flowchart TD
 
 The system transforms heterogeneous sensor streams into synchronized telemetry records. Every logged sample contains both the measured values and metadata describing timestamp quality, source freshness, and synchronization status, enabling robust post-processing and validation.
 
-```
-```
-
 ---
 
 ## Features
 
-### Data sources
+### Multi-Source Data Acquisition
 
-- **GNSS** — position, speed, course, altitude, UTC time (ATGM336H via UART + TinyGPS++)
-- **IMU** — longitudinal/lateral acceleration, roll, pitch, slope estimate with confidence (ISM330DHCX via I2C, Madgwick 6-DOF filter)
-- **OBD2** — RPM, vehicle speed, engine load, throttle position, coolant temperature (Mode 01 PIDs via CAN/TWAI or UART simulator)
+Trace acquires telemetry from multiple onboard sources and exposes them through a unified data model.
 
-### Sensor fusion
+Supported sources:
 
-- Heading estimated from gyroscope integration, corrected by GNSS course over ground (complementary filter with speed- and HDOP-weighted gain)
-- Yaw rate smoothing via EMA
-- Filtered lat/lon position (EMA, alpha scales with speed above 10 m/s)
-- Fused vehicle speed (GNSS primary, OBD2 fallback)
+* **GNSS** — position, speed, course, altitude, UTC time, HDOP, satellite count.
+* **IMU** — longitudinal and lateral acceleration, roll, pitch, slope estimation, confidence metrics.
+* **OBD2** — RPM, vehicle speed, engine load, throttle position, coolant temperature.
 
-### Gear estimation
+Each source operates independently while sharing a common synchronization framework.
 
-- Runtime gear detection based on RPM/speed ratio with configurable hysteresis (3 consecutive matching samples required before a gear change is accepted)
-- Per-gear calibration via a 2-second stable acquisition window; stability is assessed on longitudinal acceleration, speed variance, and RPM variance
-- Calibration data persisted to NVS (survives power cycles), with XOR checksum validation and versioning
-- Interactive calibration via serial commands
+---
 
-### Time synchronisation
+### Sensor Fusion
 
-- Monotonic 64-bit microsecond clock (`esp_timer`)
-- Soft UTC sync from GNSS fix, with EMA-filtered offset (α = 0.05), updated at most once per second
-- Per-sensor timestamps on every sample; staleness of each source logged per row
-- Sync quality score (0–100) with linear decay starting 5 s after the last fix, reaching 0 at 60 s
+Trace performs real-time sensor fusion to derive higher-level vehicle information from heterogeneous data sources.
 
-### Logging
+Current fusion features include:
 
-- CSV output to SD card, one row per 500 ms
-- Recording started and stopped by a **physical toggle switch** (GPIO 7, active low, 50 ms debounce)
-- Filename derived from GNSS UTC at acquisition start (`YYYYMMDD_HHMMSS.csv`)
-- Recording only begins once a valid GNSS fix has been acquired (prevents invalid filenames)
-- Automatic flush every 10 rows; system continues without logging if SD is absent
-- Fields: position, GNSS quality, OBD2 data, IMU data, heading/yaw, gear estimate, monotonic and UTC timestamps, per-sensor timestamps and ages, sync quality
+* Heading estimation from gyroscope integration corrected by GNSS course over ground.
+* Exponential smoothing of yaw rate measurements.
+* Position filtering using speed-adaptive EMA filtering.
+* Vehicle speed fusion with GNSS-primary and OBD2-fallback logic.
 
-### Status LED
+The goal is not to replace dedicated navigation systems but to improve consistency and usability of recorded telemetry.
 
-A dedicated monochromatic LED (GPIO 8) provides recording feedback without requiring a serial connection:
+---
 
-| Switch | Condition            | LED                     |
-|--------|----------------------|-------------------------|
-| OFF    | —                    | Off                     |
-| ON     | Recording active     | Solid on                |
-| ON     | Waiting for GNSS fix | Fast blink (2 Hz)       |
-| ON     | SD error             | Slow blink (1 Hz)       |
+### Gear Estimation
 
-### Web interface
+Trace estimates the currently engaged gear using a calibrated RPM-to-speed ratio model.
 
-- Wi-Fi Access Point (`192.168.4.1`, SSID: `Trace`, password: `trace-lighting`), no infrastructure required
-- Dark-mode, mobile-first HTML UI served directly from the device (no CDN, no external dependencies)
-- **LED control** (`/`): REST API and UI for mode, color, speed, brightness, and RPM warning threshold (`/api/status`, `/api/color`, `/api/mode`, `/api/params`)
-- **Log manager** (`/logs`): dedicated page to browse all CSV files on the SD card, download them directly to the connected device, and delete individual files — all without removing the SD card. File operations are blocked while recording is active.
+Features include:
 
-### RGB LED control *(legacy)*
+* Runtime gear detection.
+* Configurable hysteresis against transient misclassifications.
+* Per-gear calibration procedure.
+* Persistent calibration storage in NVS.
+* Calibration integrity checks through versioning and checksum validation.
 
-Retained for compatibility with the original hardware.
+This subsystem allows vehicles without direct gear information to reconstruct gear selection during analysis.
 
-- Modes: static color, fading (7-color cycle), breathing (sinusoidal fade)
-- RPM warning overlay: blinks red at 120 ms intervals when RPM exceeds a configurable threshold
-- All parameters configurable at runtime via web API or serial
+---
+
+### Time Synchronization
+
+One of the core design goals of Trace is deterministic timestamping.
+
+The system combines:
+
+* A monotonic 64-bit microsecond clock (`esp_timer`).
+* GNSS-derived UTC synchronization.
+* Per-sensor timestamps.
+* Sensor freshness tracking.
+* Synchronization quality metrics.
+
+Unlike traditional hobbyist data loggers, Trace records not only sensor values but also metadata describing when and how reliably those values were acquired.
+
+---
+
+### Data Logging
+
+Telemetry is periodically stored to a microSD card using a structured CSV format.
+
+Key characteristics:
+
+* One log row every 500 ms.
+* Automatic timestamp generation from GNSS UTC.
+* Recording controlled through a dedicated hardware switch.
+* Graceful handling of missing storage devices.
+* Periodic flushing to minimize data loss risk.
+
+Every log entry contains:
+
+* Raw measurements.
+* Fused quantities.
+* Synchronization metadata.
+* Sensor freshness information.
+* Quality indicators.
+
+This makes the resulting files suitable for offline processing and analysis pipelines.
+
+---
+
+### Embedded Web Interface
+
+Trace exposes a lightweight web interface through its integrated Wi-Fi Access Point.
+
+No external infrastructure, cloud services, or mobile applications are required.
+
+Available functionality:
+
+* Device configuration.
+* Runtime monitoring.
+* RGB lighting control.
+* Log file management.
+* File download.
+* File deletion.
+
+The interface is designed to be fully usable from smartphones, tablets, and laptops.
+
+---
+
+### Log Management
+
+The integrated log manager allows users to interact directly with recorded sessions.
+
+Features:
+
+* Browse available recordings.
+* Download logs wirelessly.
+* Delete individual files.
+* Access storage contents without removing the microSD card.
+
+To guarantee data integrity, file operations are automatically disabled while recording is active.
+
+---
+
+### RGB Lighting System (Legacy)
+
+Trace originally evolved from a commercial automotive RGB lighting controller.
+
+Although telemetry is now the primary focus of the project, the RGB subsystem remains available for compatibility with the original hardware platform.
+
+Supported modes include:
+
+* Static color.
+* Color fading.
+* Breathing effect.
+* RPM warning overlay.
+
+All parameters can be adjusted through either the web interface or serial commands.
 
 ---
 
 ## Hardware
 
-| Component              | Role                                            |
-|------------------------|-------------------------------------------------|
-| ESP32-S3               | Main MCU                                        |
-| ATGM336H               | GNSS receiver (UART)                            |
-| ISM330DHCX             | 6-DOF IMU (I2C)                                 |
-| MCP2515 / TWAI         | CAN bus interface for OBD2                      |
-| SD card (SPI)          | Data storage                                    |
-| Toggle switch          | Recording control (active low, internal pull-up)|
-| Monochromatic LED      | Recording status indicator                      |
-| RGB LED (common anode) | Status / legacy feature                         |
+Trace is built around a compact set of automotive-oriented components.
 
-All pin assignments are configurable via `#define` constants at the top of each manager header.
+| Component      | Purpose                   |
+| -------------- | ------------------------- |
+| ESP32-S3       | Main processing unit      |
+| ATGM336H       | GNSS receiver             |
+| ISM330DHCX     | 6-DOF IMU                 |
+| MCP2515 / TWAI | OBD2 CAN interface        |
+| microSD card   | Telemetry storage         |
+| Toggle switch  | Recording control         |
+| Status LED     | Recording feedback        |
+| RGB LED strip  | Legacy lighting subsystem |
+
+All hardware assignments are configurable through compile-time definitions.
+
+The platform is intentionally modular and can be adapted to alternative sensors and interfaces with minimal firmware changes.
 
 ---
 
-## Getting started
+## Design Principles
+
+The project is guided by several engineering principles:
+
+### Modularity
+
+Subsystems are isolated into dedicated managers responsible for acquisition, processing, synchronization, logging, and visualization.
+
+### Data Ownership
+
+All recorded data is stored locally in open formats without cloud dependencies or proprietary services.
+
+### Traceability
+
+Every logged sample includes metadata describing timing quality and source freshness.
+
+### Extensibility
+
+New sensors, derived metrics, and analysis tools can be integrated without major architectural changes.
+
+### Reliability
+
+The system is designed to continue operating gracefully under degraded conditions such as temporary GNSS loss or missing storage devices.
+
+---
+
+---
+
+## Getting Started
 
 ### Requirements
 
-- [PlatformIO](https://platformio.org/) or Arduino IDE with ESP32 board support
-- Libraries: `TinyGPSPlus`, `ArduinoJson`, `Preferences` (bundled with ESP32 core)
+Supported development environments:
 
-### Build & flash
+* [PlatformIO](https://platformio.org/)
+* Arduino IDE with ESP32 board support
+
+Required libraries:
+
+* TinyGPSPlus
+* ArduinoJson
+* Preferences (included in ESP32 core)
+
+---
+
+### Build & Flash
 
 ```bash
-# Clone the repo
+# Clone repository
 git clone https://github.com/mdmmt05/Trace.git
+
+# Enter project directory
 cd Trace
 
-# Build and flash (PlatformIO)
+# Build and upload
 pio run -t upload
 ```
 
-### OBD2 transport selection
+---
 
-By default the firmware compiles with the **UART simulator** transport (useful for development without a real vehicle). To target a real CAN bus, define `OBD2_USE_TWAI` in your build flags:
+### OBD2 Transport Selection
+
+By default Trace compiles using the UART-based OBD2 simulator, allowing development and testing without a vehicle.
+
+To enable CAN/TWAI communication with a real vehicle:
 
 ```ini
-; platformio.ini
 build_flags = -DOBD2_USE_TWAI
 ```
 
-### Boot behaviour
-
-On startup the system waits for a valid GNSS fix before allowing recording to begin. If the recording switch is already ON at boot, the status LED will blink at 2 Hz until the fix is acquired. After a **5-minute timeout** the system transitions to running regardless, to allow indoor testing without GNSS. The IMU performs a ~1-second gyroscope initialisation during `setup()` — the vehicle should be stationary at this point for best results.
+in `platformio.ini`.
 
 ---
 
-## Serial commands
+### Boot Behaviour
 
-Connect at **115200 baud**. Commands are terminated with `\n`. Type `help` to list all available commands.
+At startup Trace performs the following sequence:
 
-### General
+1. Hardware initialization.
+2. IMU calibration loading.
+3. GNSS acquisition.
+4. Time synchronization setup.
+5. Web interface initialization.
 
-| Command | Description |
-|---------|-------------|
-| `help`  | List all available commands |
+Recording is only allowed after a valid GNSS fix has been obtained.
 
-### IMU calibration
+If the recording switch is already active during boot:
 
-| Command | Description |
-|---------|-------------|
-| `cal_gyro` | Gyroscope bias calibration (vehicle stationary) |
-| `cal_acc` | Accelerometer calibration (vehicle stationary and level) |
-| `set_mounting <roll> <pitch>` | Set sensor mounting offset in degrees |
-| `save_cal` | Save current IMU calibration to NVS |
-| `reset_cal` | Reset IMU calibration to defaults |
-| `show_cal` | Print current IMU calibration parameters and time sync status |
+* Status LED blinks at 2 Hz while waiting for GNSS.
+* Recording automatically starts once a valid fix is available.
 
-### Gear calibration
-
-| Command | Description |
-|---------|-------------|
-| `gear_help` | List gear commands |
-| `gear_show` | Show current per-gear calibration (ratio, speed ref, RPM ref) |
-| `gear_cal <1..5>` | Start a 2-second stable acquisition window for the specified gear |
-| `gear_save` | Persist the last completed acquisition to NVS |
-| `gear_reset` | Clear all gear calibration data from NVS |
-
-**Calibration procedure:** engage the target gear at a steady speed, run `gear_cal <N>`, wait 2 seconds for the acquisition window to close, then confirm with `gear_save`. The system checks longitudinal acceleration, speed variance (< 2 km/h range), and RPM variance (< 200 RPM range) to reject unstable captures. A minimum of 10 valid samples must be collected within the 2-second window.
+After a configurable timeout, the system enters operational mode even without GNSS to support indoor testing.
 
 ---
 
-## CSV output format
+## Serial Commands
 
-Each row contains:
+Trace exposes a serial maintenance interface at **115200 baud**.
 
+### General Commands
+
+| Command | Description             |
+| ------- | ----------------------- |
+| `help`  | Show available commands |
+
+---
+
+### IMU Calibration
+
+| Command                       | Description                    |
+| ----------------------------- | ------------------------------ |
+| `cal_gyro`                    | Calibrate gyroscope bias       |
+| `cal_acc`                     | Calibrate accelerometer        |
+| `set_mounting <roll> <pitch>` | Set sensor mounting offset     |
+| `save_cal`                    | Save calibration to NVS        |
+| `reset_cal`                   | Restore default calibration    |
+| `show_cal`                    | Display calibration parameters |
+
+---
+
+### Gear Calibration
+
+| Command           | Description                          |
+| ----------------- | ------------------------------------ |
+| `gear_help`       | Show gear commands                   |
+| `gear_show`       | Display calibration values           |
+| `gear_cal <1..5>` | Start calibration for specified gear |
+| `gear_save`       | Save calibration                     |
+| `gear_reset`      | Delete all calibration data          |
+
+#### Calibration Procedure
+
+1. Drive at a stable speed.
+2. Engage the target gear.
+3. Execute:
+
+```text
+gear_cal N
 ```
+
+4. Wait for the acquisition window to complete.
+5. Confirm the calibration using:
+
+```text
+gear_save
+```
+
+Trace automatically rejects unstable acquisitions based on:
+
+* Speed variance.
+* RPM variance.
+* Longitudinal acceleration variance.
+
+---
+
+## CSV Output Format
+
+Telemetry is stored as human-readable CSV files.
+
+A typical record contains:
+
+```text
 timestamp_utc_str,
 lat, lon, alt_m, sat, hdop,
 speed_obd_kmh,
 acc_lon_G, acc_lat_G,
-roll_deg, pitch_deg, slope_deg, slope_confidence,
-heading_deg, yawRate_dps, heading_confidence,
+roll_deg, pitch_deg, slope_deg,
+heading_deg, yawRate_dps,
 rpm, load_pct, throttle_pct,
 estimated_gear,
-t_mono_us, utc_epoch_us, utc_valid, sync_quality,
+t_mono_us, utc_epoch_us,
+sync_quality,
 imu_t_us, gnss_t_us, obd_speed_t_us,
 imu_age_ms, gnss_age_ms, obd_speed_age_ms
 ```
 
-The `*_age_ms` columns record how stale each sensor's data was at log time — useful for post-processing quality filtering. A value of `-1` means no sample has been received yet for that source.
+Each record includes:
+
+* Raw sensor measurements.
+* Derived quantities.
+* Synchronization metadata.
+* Source freshness metrics.
+
+This structure is specifically designed to support advanced offline analysis through Trace Studio.
 
 ---
 
-## Project structure
+## Project Structure
 
+```text
+├── main.cpp
+├── shared_data.h
+
+├── gnss_manager.*
+├── imu_manager.*
+├── obd2_manager.*
+
+├── vehicle_fusion_manager.*
+├── gear_estimator.*
+├── time_sync_manager.*
+
+├── sd_manager.*
+├── web_server.*
+├── rgb_controller.*
 ```
-├── main.cpp                  # Setup, loop, switch/LED logic, serial command handler
-├── shared_data.h             # Global VehicleData struct (all producers/consumers)
-├── gnss_manager.*            # GNSS UART + TinyGPS++ integration
-├── imu_manager.*             # ISM330DHCX driver, Madgwick filter, NVS calibration
-├── obd2_manager.*            # OBD2 CAN decoder (TWAI + UART simulator)
-├── vehicle_fusion_manager.*  # Sensor fusion: heading, position, speed
-├── gear_estimator.*          # RPM/speed gear detection + NVS calibration
-├── time_sync_manager.*       # Monotonic clock + GNSS soft UTC sync
-├── sd_manager.*              # SPI SD card + CSV writer
-├── web_server.*              # AP-mode WebServer + REST API + embedded UI
-└── rgb_controller.*          # RGB LED driver (legacy)
-```
+
+### Module Overview
+
+| Module                   | Responsibility                 |
+| ------------------------ | ------------------------------ |
+| `gnss_manager`           | GNSS acquisition and parsing   |
+| `imu_manager`            | IMU processing and calibration |
+| `obd2_manager`           | OBD-II communication           |
+| `vehicle_fusion_manager` | Sensor fusion                  |
+| `gear_estimator`         | Gear estimation                |
+| `time_sync_manager`      | Timestamp synchronization      |
+| `sd_manager`             | Telemetry logging              |
+| `web_server`             | Wi-Fi UI and REST API          |
+| `rgb_controller`         | Lighting subsystem             |
+
+---
+
+## Roadmap
+
+### Completed
+
+* GNSS integration
+* IMU integration
+* OBD2 integration
+* Sensor fusion
+* Gear estimation
+* Time synchronization
+* CSV logging
+* Embedded web interface
+* Wireless log management
+* Trace Studio integration
+
+---
+
+### Planned
+
+#### Acquisition
+
+* Additional OBD-II PIDs
+* Configurable logging rates
+* Multi-rate logging support
+* Additional CAN bus interfaces
+
+#### Processing
+
+* Additional derived vehicle metrics
+* Improved sensor fusion algorithms
+* Enhanced heading estimation
+
+#### Connectivity
+
+* Bluetooth Low Energy support
+* Remote telemetry streaming
+* Optional companion mobile application
+
+#### Ecosystem
+
+* Tighter integration with Trace Studio
+* Automated session metadata exchange
+* Shared configuration management
 
 ---
 
 ## License
 
-MIT
+This project is distributed under the MIT License.
+
+See the `LICENSE` file for details.
+
+---
+
+## Acknowledgements
+
+Trace was developed as a personal engineering project motivated by the desire to better understand vehicle behaviour through accessible and fully transparent telemetry.
+
+Special thanks to the open-source communities behind:
+
+* ESP32
+* PlatformIO
+* TinyGPS++
+* ArduinoJson
+
+whose tools made the project possible.
+
+```
+```
+
