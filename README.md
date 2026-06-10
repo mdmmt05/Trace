@@ -1,31 +1,152 @@
-# Trace
+# 🏁 Trace
 
-**Trace** is an open-source vehicle data logger built on the ESP32-S3. It collects, timestamps, and fuses data from multiple onboard sources — GNSS, IMU, OBD2 — and writes it to a CSV file on an SD card. Recording is controlled by a physical toggle switch with 50 ms debounce logic and a dedicated monochromatic status LED. A lightweight web interface served over Wi-Fi Access Point allows real-time configuration without any dedicated app.
+> Open-source vehicle telemetry platform built on ESP32-S3.
 
-Trace was originally designed as a replacement for a commercial device that also drove an RGB LED strip. That LED subsystem is still present and functional, but the project's focus today is squarely on **data logging and analysis**.
+[![ESP32-S3](https://img.shields.io/badge/MCU-ESP32--S3-blue)]()
+[![PlatformIO](https://img.shields.io/badge/PlatformIO-Compatible-orange)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Trace is an open-source vehicle telemetry platform designed to acquire, synchronize, process, and store automotive data from multiple onboard sources.
+
+The system integrates GNSS, IMU, and OBD2/CAN telemetry into a unified time base, performs real-time sensor fusion, estimates derived vehicle states, and periodically records synchronized telemetry to a microSD card for post-session analysis.
+
+Trace was originally developed as a personal alternative to commercial telemetry devices, with the goal of providing complete control over hardware, firmware, data formats, and analysis workflows. Over time, the project evolved into a modular telemetry platform capable of supporting vehicle monitoring, driving analysis, experimentation, and performance-oriented applications.
+
+---
 
 ## Trace Ecosystem
 
-**Trace Ecosystem** è una piattaforma completa per l'acquisizione, la sincronizzazione e l'analisi di dati telemetrici automotive.
+**Trace Ecosystem** is a complete telemetry platform designed for the acquisition, synchronization, storage, and analysis of automotive data.
 
-L'ecosistema è composto da due progetti principali:
+The ecosystem consists of two complementary projects:
 
 ### Trace
 
-Data logger embedded basato su ESP32-S3 progettato per acquisire e sincronizzare dati provenienti da GNSS, IMU e rete veicolo (OBD2/CAN), con registrazione locale su microSD e configurazione tramite interfaccia web integrata.
+An ESP32-S3-based embedded data logger that acquires and synchronizes data from GNSS, IMU, and vehicle networks (OBD2/CAN), storing telemetry locally on a microSD card while providing configuration and monitoring through a built-in web interface.
 
 ### Trace Studio
 
-Piattaforma desktop sviluppata in Python per l'analisi delle sessioni registrate da Trace. Include dashboard interattive, visualizzazione geografica, analisi prestazionali, elaborazione dati e strumenti di validazione della qualità della telemetria.
+A Python-based telemetry analysis platform that processes and visualizes sessions recorded by Trace. It provides interactive dashboards, synchronized time-series plots, GNSS map visualization, performance analysis, and data-quality validation tools.
 
-### Obiettivo
+### Goal
 
-L'obiettivo del progetto è fornire una soluzione completamente autonoma per raccogliere, esplorare e analizzare dati di guida, dalla generazione del dato sul veicolo fino alla sua interpretazione attraverso strumenti software dedicati.
+The goal of the project is to provide a fully self-contained solution for collecting, exploring, and understanding vehicle telemetry, covering the entire workflow from data acquisition on the vehicle to post-session analysis and visualization.
 
 ### Repositories
 
-- **[Trace](https://github.com/mdmmt05/Trace)** — Embedded Data Logger
-- **[Trace Studio](https://github.com/mdmmt05/Trace-Studio)** — Telemetry Analysis Platform
+* **[Trace](https://github.com/mdmmt05/Trace)** — Embedded Data Logger
+* **[Trace Studio](https://github.com/mdmmt05/Trace-Studio)** — Telemetry Analysis Platform
+
+---
+
+## Project Overview
+
+Trace is organized as a modular telemetry acquisition platform built around an ESP32-S3.
+
+The system collects data from multiple heterogeneous sources, synchronizes them to a common monotonic time base, performs real-time processing and sensor fusion, and periodically stores the resulting telemetry to removable storage.
+
+Key design goals include:
+
+* Modular firmware architecture.
+* Deterministic timestamping and synchronization.
+* Reliable operation in field conditions.
+* Human-readable and analysis-friendly log formats.
+* Complete ownership of the acquisition and analysis pipeline.
+* Extensibility toward future sensors and vehicle interfaces.
+
+The resulting platform is capable of transforming raw vehicle telemetry into structured datasets that can be explored through the companion application **Trace Studio**.
+
+---
+
+## System Architecture
+
+### Hardware Architecture
+
+```mermaid
+flowchart LR
+    CAR[Vehicle] -->|OBD-II / CAN| CAN[CAN / TWAI interface]
+    GNSS[ATGM336H GNSS] -->|UART| ESP[ESP32-S3]
+    IMU[ISM330DHCX IMU] -->|I2C| ESP
+    CAN --> ESP
+    SD[microSD card] <-->|SPI| ESP
+
+    SWITCH[Recording switch] -->|GPIO 7| ESP
+    RECLED[Recording status LED] <-->|GPIO 8| ESP
+    RGB[RGB LED strip / ambient lighting] <-->|PWM GPIO 4/5/6| ESP
+
+    PHONE[Phone / browser] <-->|Wi-Fi AP 192.168.4.1| ESP
+```
+
+The ESP32-S3 acts as the central processing unit of the system, collecting data from all onboard sensors and interfaces, performing synchronization and fusion tasks, and exposing both local logging and wireless configuration capabilities.
+
+### Firmware Architecture
+
+```mermaid
+flowchart TD
+    MAIN[main.cpp<br>Main loop / system state] --> GNSSM[gnss_manager<br>GNSS parsing + fix status]
+    MAIN --> IMUM[imu_manager<br>IMU FIFO + Madgwick + slope]
+    MAIN --> OBDM[obd2_manager<br>OBD-II PID polling + decode]
+    MAIN --> FUSION[vehicle_fusion_manager<br>Heading / speed / position fusion]
+    MAIN --> GEAR[gear_estimator<br>RPM-speed gear estimation]
+    MAIN --> TIME[time_sync_manager<br>Monotonic clock + GNSS UTC sync]
+    MAIN --> SDM[sd_manager<br>CSV logging to SD]
+    MAIN --> RGBM[rgb_controller<br>RGB modes + RPM warning]
+    MAIN --> WEB[web_server<br>Wi-Fi AP + REST API + UI]
+
+    GNSSM --> TIME
+    GNSSM --> FUSION
+    IMUM --> FUSION
+    OBDM --> FUSION
+    OBDM --> GEAR
+
+    GNSSM --> SHARED[shared_data / snapshots]
+    IMUM --> SHARED
+    OBDM --> SHARED
+    GEAR --> SHARED
+
+    SHARED --> SDM
+    SHARED --> RGBM
+    WEB --> RGBM
+```
+
+The firmware follows a modular architecture where each subsystem is responsible for a specific aspect of acquisition, processing, synchronization, logging, or visualization.
+
+This separation improves maintainability and allows individual modules to evolve independently.
+
+### Data Flow
+
+```mermaid
+flowchart TD
+    GNSSRAW[GNSS NMEA data] --> GNSS[GNSS snapshot<br>lat/lon/alt/speed/course/UTC/HDOP/sat]
+    IMURAW[IMU raw acc + gyro] --> IMU[IMU processed data<br>acc lon/lat, roll, pitch, slope, confidence]
+    OBDRAW[OBD-II CAN frames] --> OBD[OBD decoded data<br>RPM, speed, load, throttle, coolant]
+
+    GNSS --> TIMESYNC[Time sync<br>UTC = monotonic time + GNSS offset]
+    GNSS --> FUSION[Vehicle fusion<br>heading, yaw rate, fused speed, filtered position]
+    IMU --> FUSION
+    OBD --> FUSION
+
+    OBD --> GEAR[Gear estimator<br>RPM / speed ratio + hysteresis]
+    GEAR --> SHARED[VehicleData / shared state]
+    IMU --> SHARED
+    OBD --> SHARED
+    FUSION --> LOGROW[Log row builder]
+    TIMESYNC --> LOGROW
+    GNSS --> LOGROW
+    SHARED --> LOGROW
+
+    LOGROW --> CSV[CSV row every 500 ms<br>microSD]
+    SWITCH[Recording switch] --> RECSTATE[Recording state machine]
+    RECSTATE --> CSV
+
+    SHARED --> RGB[RGB controller<br>ambient lighting + RPM warning]
+    WEB[Web API] --> RGB
+```
+
+The system transforms heterogeneous sensor streams into synchronized telemetry records. Every logged sample contains both the measured values and metadata describing timestamp quality, source freshness, and synchronization status, enabling robust post-processing and validation.
+
+```
+```
 
 ---
 
