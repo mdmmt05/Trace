@@ -4,6 +4,29 @@
 
 Trace was originally designed as a replacement for a commercial device that also drove an RGB LED strip. That LED subsystem is still present and functional, but the project's focus today is squarely on **data logging and analysis**.
 
+## Trace Ecosystem
+
+**Trace Ecosystem** è una piattaforma completa per l'acquisizione, la sincronizzazione e l'analisi di dati telemetrici automotive.
+
+L'ecosistema è composto da due progetti principali:
+
+### Trace
+
+Data logger embedded basato su ESP32-S3 progettato per acquisire e sincronizzare dati provenienti da GNSS, IMU e rete veicolo (OBD2/CAN), con registrazione locale su microSD e configurazione tramite interfaccia web integrata.
+
+### Trace Studio
+
+Piattaforma desktop sviluppata in Python per l'analisi delle sessioni registrate da Trace. Include dashboard interattive, visualizzazione geografica, analisi prestazionali, elaborazione dati e strumenti di validazione della qualità della telemetria.
+
+### Obiettivo
+
+L'obiettivo del progetto è fornire una soluzione completamente autonoma per raccogliere, esplorare e analizzare dati di guida, dalla generazione del dato sul veicolo fino alla sua interpretazione attraverso strumenti software dedicati.
+
+### Repositories
+
+- **[Trace](https://github.com/mdmmt05/Trace)** — Embedded Data Logger
+- **[Trace Studio](https://github.com/mdmmt05/Trace-Studio)** — Telemetry Analysis Platform
+
 ---
 
 ## Features
