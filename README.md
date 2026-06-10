@@ -332,8 +332,6 @@ The system is designed to continue operating gracefully under degraded condition
 
 ---
 
----
-
 ## Getting Started
 
 ### Requirements
